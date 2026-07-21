@@ -1,0 +1,5 @@
+# R큐브 PC 제어 프로그램 의존성
+bleak>=0.22         # BLE Central — R큐브 BLE 스캔/연결/제어 (Windows/mac/Linux)
+python-can>=4.3     # USB-CAN 어댑터 제어 (Phase 7 CAN 서브로봇유닛)
+pyserial>=3.5       # 시리얼(USB-CAN 일부 어댑터 / 디버그)
+rich>=13.0          # CLI 출력·센서 스트림 표시

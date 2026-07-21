@@ -1,0 +1,31 @@
+# ===========================================================
+# R큐브 펌웨어 기본 sdkconfig (menuconfig 시 이 값이 초기값)
+# 보드: ESP32-S3-WROOM-1-N16R2 (16MB Flash / 2MB PSRAM)
+# ===========================================================
+
+# ---- 타겟 ----
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- 플래시 16MB + 커스텀 파티션(2-OTA + LittleFS 미션 저장, 로드맵 12.6) ----
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM (N16R2 = 2MB Quad) ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+
+# ---- BLE: NimBLE 호스트 사용 (Bluedroid 비활성, 로드맵 12.1) ----
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# ---- CAN(TWAI): OTA/플래시 쓰기 중에도 살아있도록 ISR을 IRAM에 배치(로드맵 12.6) ----
+CONFIG_TWAI_ISR_IN_IRAM=y
+
+# ---- 워치독: Task WDT (로드맵 12.7) ----
+CONFIG_ESP_TASK_WDT_INIT=y
+
+# ---- 로그 ----
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
