@@ -1,0 +1,46 @@
+# ==========================================================
+# R큐브 저장소 공통 .gitignore
+# ==========================================================
+
+# ---- ESP-IDF / ESP32 펌웨어 (esp32/) ----
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.*
+*.bin
+*.elf
+*.map
+*.o
+*.a
+dependencies.lock
+managed_components/
+
+# ---- STM32 벤더 산출물(참고용이 섞여 들어올 경우) ----
+*.hex
+
+# ---- Python / PC 제어 프로그램 (app/) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+
+# ---- 에디터 / IDE ----
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 로그 / 임시 ----
+*.log
+tmp/
