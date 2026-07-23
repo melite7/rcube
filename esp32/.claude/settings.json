@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(try { $p = New-Object System.IO.Ports.SerialPort COM3; $p.Open\\(\\); $p.Close\\(\\); \"COM3 OPEN OK - now free\" } catch { \"COM3 STILL BUSY: \" + $_.Exception.Message }; \"--- python/idf processes holding it ---\"; Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Select-Object ProcessId, @{n='cmd';e={$_.CommandLine.Substring\\(0,[Math]::Min\\(90,$_.CommandLine.Length\\)\\)}} | Format-Table -AutoSize -Wrap)"
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+## 앱(main) 컴포넌트의 외부 의존성.
+## SK6812/WS2812 구동은 RMT 기반 espressif/led_strip 사용(비트뱅잉보다 타이밍 정확).
+dependencies:
+  espressif/led_strip: "^2.5.5"
+  idf:
+    version: ">=5.0"
