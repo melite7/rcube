@@ -27,6 +27,7 @@ typedef struct {
     void (*agg_start)(uint8_t link_count, uint8_t group_mode); /* 아그리게이터 승격 */
     void (*agg_stop)(void);                              /* 아그리게이터 해제 */
     int  (*forward)(uint8_t target_id, const uint8_t *frame, uint16_t len); /* 멤버 중계 */
+    int  (*forward_all)(const uint8_t *frame, uint16_t len);  /* 전 멤버로 브로드캐스트 중계 */
 } rcube_cmd_ops_t;
 
 /* 명령 레이어 초기화. ops 는 호출 이후에도 유효한 저장소를 가리켜야 한다. */

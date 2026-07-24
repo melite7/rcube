@@ -210,6 +210,36 @@ int ble_multirole_forward(uint8_t target_id, const uint8_t *frame, uint16_t len)
     return 0;
 }
 
+int ble_multirole_broadcast(const uint8_t *frame, uint16_t len)
+{
+    if (!s_active) {
+        return -1;
+    }
+    if (len < 4 || len > FWD_BUF_MAX) {
+        ESP_LOGW(TAG, "broadcast: 길이 %u 부적합", len);
+        return -1;
+    }
+    uint8_t buf[FWD_BUF_MAX];
+    memcpy(buf, frame, len);
+    buf[0] = RCUBE_ADDR_HUB;   /* 멤버가 '자기 명령'으로 처리하도록 */
+
+    int sent = 0;
+    for (int i = 0; i < MAX_MEMBERS; i++) {
+        member_t *m = &s_members[i];
+        if (m->state != SLOT_READY) {
+            continue;
+        }
+        int rc = ble_gattc_write_flat(m->conn_handle, m->chr_val_handle, buf, len, NULL, NULL);
+        if (rc == 0) {
+            sent++;
+        } else {
+            ESP_LOGW(TAG, "broadcast: vid=%u write 실패 rc=%d", m->vid, rc);
+        }
+    }
+    ESP_LOGI(TAG, "broadcast: %d개 멤버로 %u bytes 중계", sent, len);
+    return sent;
+}
+
 uint8_t ble_multirole_member_count(void)
 {
     return count_ready();

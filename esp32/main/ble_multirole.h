@@ -29,5 +29,9 @@ void ble_multirole_stop_aggregator(void);
  * 성공 0. 아그리게이터가 아니거나 대상 멤버가 없으면 음수. */
 int ble_multirole_forward(uint8_t target_id, const uint8_t *frame, uint16_t len);
 
+/* 브로드캐스트: 현재 READY인 모든 멤버로 프레임을 중계(target은 0xFE로 재기입).
+ * 전송한 멤버 수를 반환. 아그리게이터가 아니면 음수. */
+int ble_multirole_broadcast(const uint8_t *frame, uint16_t len);
+
 /* 현재 READY(특성까지 확보) 상태 멤버 수. */
 uint8_t ble_multirole_member_count(void);

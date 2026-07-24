@@ -1,10 +1,14 @@
 #include "rcube_cmd.h"
 #include "board_led.h"
+#include "rcube_config.h"
 
 #include <string.h>
 #include <stdbool.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_system.h"
 
 /* opcode/주소/결과코드는 shared-protocol(단일 소스)에서 그대로 가져온다. */
 #include "rcube_protocol.h"
@@ -114,6 +118,46 @@ static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
     return RCUBE_RC_OK;
 }
 
+/* ---- 지연 재부팅 ----------------------------------------------------- */
+/* 회신(notify)·멤버 중계 write가 나갈 시간을 준 뒤 재부팅한다. */
+#define REBOOT_DELAY_MS 800
+
+static bool s_reboot_scheduled;
+
+static void reboot_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
+    ESP_LOGW(TAG, "재부팅 실행(esp_restart)");
+    esp_restart();
+}
+
+static void schedule_reboot(void)
+{
+    if (s_reboot_scheduled) {
+        return;
+    }
+    s_reboot_scheduled = true;
+    ESP_LOGW(TAG, "설정 적용 → %d ms 후 재부팅 예약", REBOOT_DELAY_MS);
+    xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
+}
+
+/* D3 SetNodeConfig: payload=[group_id]. 그룹번호를 NVS에 저장하고 재부팅.
+ * (계약: 지금은 group_id 1바이트. 추후 node_id 등 필드 확장 가능.) */
+static uint8_t handle_set_node_config(const uint8_t *p, uint16_t len)
+{
+    if (len < 1) {
+        return RCUBE_RC_BAD_LENGTH;
+    }
+    uint8_t group = p[0];
+    esp_err_t err = rcube_config_set_group_id(group);
+    if (err != ESP_OK) {
+        return RCUBE_RC_FLASH_FAIL;
+    }
+    ESP_LOGI(TAG, "SetNodeConfig: group_id=0x%02x 저장", group);
+    schedule_reboot();
+    return RCUBE_RC_OK;
+}
+
 /* ---- 파서 + 디스패처 ------------------------------------------------- */
 void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
 {
@@ -158,6 +202,15 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
         if (rc != RCUBE_RC_OK) {
             reply_cmd_ack(op, rc);
         }
+        break;
+
+    case RCUBE_OP_SetNodeConfig:
+        /* 브로드캐스트면 아그리게이터가 먼저 전 멤버로 중계(멤버도 저장+재부팅). */
+        if (target == RCUBE_ADDR_BROADCAST && s_ops.forward_all != NULL) {
+            s_ops.forward_all(data, len);
+        }
+        rc = handle_set_node_config(payload, plen);
+        reply_cmd_ack(op, rc);
         break;
 
     default:

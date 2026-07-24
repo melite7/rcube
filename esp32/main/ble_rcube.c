@@ -329,10 +329,11 @@ void ble_rcube_init(void)
 
     /* 명령 레이어 준비: 회신=peripheral notify, 멀티롤/중계=central 레이어. */
     static const rcube_cmd_ops_t cmd_ops = {
-        .send      = ble_rcube_notify_pc,
-        .agg_start = ble_multirole_start_aggregator,
-        .agg_stop  = ble_multirole_stop_aggregator,
-        .forward   = ble_multirole_forward,
+        .send        = ble_rcube_notify_pc,
+        .agg_start   = ble_multirole_start_aggregator,
+        .agg_stop    = ble_multirole_stop_aggregator,
+        .forward     = ble_multirole_forward,
+        .forward_all = ble_multirole_broadcast,
     };
     rcube_cmd_init(&cmd_ops);
 
