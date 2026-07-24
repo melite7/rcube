@@ -19,6 +19,11 @@ CONFIG_SPIRAM=n
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
+# 멀티롤(Phase 5): 아그리게이터는 PC(peripheral) 1 + 멤버(central) 최대 3 = 4연결.
+# R4까지 커버하도록 동시 연결 수를 5로(여유 1). central/GATT client는 기본 활성.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=5
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_GATT_CLIENT=y
 
 # ---- CAN(TWAI): OTA/플래시 쓰기 중에도 살아있도록 ISR을 IRAM에 배치(로드맵 12.6) ----
 CONFIG_TWAI_ISR_IN_IRAM=y

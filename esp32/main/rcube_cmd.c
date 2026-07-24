@@ -4,8 +4,6 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "esp_log.h"
 
 /* opcode/주소/결과코드는 shared-protocol(단일 소스)에서 그대로 가져온다. */
@@ -15,16 +13,8 @@ static const char *TAG = "cmd";
 
 #define HEADER_LEN 4
 
-/* 회신(notify) 송신 콜백. */
-static rcube_send_fn s_send;
-
-/* ---- 아그리게이터 상태(A0 이후) ----
- * Phase 2에서는 상태만 보관하고 실제 멤버 BLE 연결은 하지 않는다(Phase 5). */
-static SemaphoreHandle_t s_lock;
-static bool    s_is_aggregator;      /* A0로 아그리게이터 승격됨 */
-static uint8_t s_link_count;         /* 목표 큐브 수(본인 포함 총 N) */
-static uint8_t s_group_mode;         /* 0x0A=그룹무관, 0x1A=같은그룹 */
-static uint8_t s_members_connected;  /* 현재 연결된 멤버 수(본인 제외) */
+/* 전송계층 위임 콜백. */
+static rcube_cmd_ops_t s_ops;
 
 /* 이 큐브가 직접 처리해야 하는 대상 주소인지(직접연결 허브 · 브로드캐스트). */
 static inline bool addr_for_me(uint8_t target)
@@ -48,7 +38,7 @@ static inline void put_header(uint8_t *f, uint8_t target, uint8_t op, uint16_t t
  *   펌웨어가 먼저 정한 계약(app과 맞춰야 함, 미검증). 발신=자기(허브). */
 static void reply_cmd_ack(uint8_t req_op, uint8_t result)
 {
-    if (s_send == NULL) {
+    if (s_ops.send == NULL) {
         return;
     }
     uint8_t f[HEADER_LEN + 2];
@@ -56,34 +46,31 @@ static void reply_cmd_ack(uint8_t req_op, uint8_t result)
     put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_CmdAck, total);
     f[4] = req_op;
     f[5] = result;
-    s_send(f, total);
+    s_ops.send(f, total);
 }
 
-/* SetMultiroleInAction(0xA1) 회신: payload[0]=현재 연결된 멤버 수.
+/* SetMultiroleInAction(0xA1) 회신: payload[0]=현재 연결된 멤버 수(본인 제외).
  * app(gui.py)이 이 값을 보고 R2~R4 진행도를 갱신한다(계약). */
-static void reply_multirole_event(uint8_t members_connected)
+void rcube_cmd_report_members(uint8_t members_connected)
 {
-    if (s_send == NULL) {
+    if (s_ops.send == NULL) {
         return;
     }
     uint8_t f[HEADER_LEN + 1];
     uint16_t total = sizeof(f);
     put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_SetMultiroleInAction, total);
     f[4] = members_connected;
-    s_send(f, total);
+    s_ops.send(f, total);
+    ESP_LOGI(TAG, "→ 0xA1 report: members=%u", members_connected);
 }
 
 /* ---- 개별 명령 처리 -------------------------------------------------- */
 
 /* E0 SetSK6812LED: payload = [n][R,G,B]×n.
- * 온보드 LED는 1개뿐이므로 LED0 색을 대표로 점등하고 전체 세트는 로깅한다. */
-static uint8_t handle_set_led(uint8_t target, const uint8_t *p, uint16_t len)
+ * 온보드 LED는 1개뿐이므로 LED0 색을 대표로 점등하고 전체 세트는 로깅한다.
+ * (자기 대상 프레임에서만 호출된다 — 멤버 대상은 상위에서 중계 처리) */
+static uint8_t handle_set_led(const uint8_t *p, uint16_t len)
 {
-    if (!addr_for_me(target)) {
-        /* 멤버(가상노드ID) 대상 → 아그리게이터가 하위로 중계(Phase 5). */
-        ESP_LOGW(TAG, "SetSK6812LED for node 0x%02x — forward not implemented (Phase 5)", target);
-        return RCUBE_RC_NODE_NOT_FOUND;
-    }
     if (len < 1) {
         return RCUBE_RC_BAD_LENGTH;
     }
@@ -104,34 +91,26 @@ static uint8_t handle_set_led(uint8_t target, const uint8_t *p, uint16_t len)
 }
 
 /* A0 SetMultiroleAggregator: payload = [ConnectionLinkCount][GroupMode] (+ vids).
- * 이 큐브를 아그리게이터로 승격, 자기 RED 점등 후 0xA1로 회신.
- * 실제 멤버 스캔·연결(BLE central)은 Phase 5. */
-static uint8_t handle_set_aggregator(uint8_t target, const uint8_t *p, uint16_t len)
+ * 이 큐브를 아그리게이터로 승격, 자기 RED 점등 후 멤버 스캔·연결을 시작한다.
+ * 멤버가 붙을 때마다 멀티롤 레이어가 rcube_cmd_report_members()로 0xA1을 보낸다. */
+static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
 {
-    if (!addr_for_me(target)) {
-        return RCUBE_RC_NODE_NOT_FOUND;
-    }
     if (len < 2) {
         return RCUBE_RC_BAD_LENGTH;
     }
     uint8_t link_count = p[0];
     uint8_t group_mode = p[1];
 
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_is_aggregator = true;
-    s_link_count = link_count;
-    s_group_mode = group_mode;
-    s_members_connected = 0;
-    uint8_t members = s_members_connected;
-    xSemaphoreGive(s_lock);
-
     board_led_set(255, 0, 0);   /* 아그리게이터 표시 = 빨강(순수색, 밝기는 board_led) */
     ESP_LOGI(TAG, "SetMultiroleAggregator: total=%u, group_mode=0x%02x → 아그리게이터 승격(RED)",
              link_count, group_mode);
-    ESP_LOGW(TAG, "멤버 BLE 스캔·연결은 Phase 5 미구현 → 0xA1(members=%u)만 회신", members);
 
-    /* 아그리게이터 승격 사실을 0xA1로 알린다(현재 멤버 수 = 0). */
-    reply_multirole_event(members);
+    if (s_ops.agg_start != NULL) {
+        s_ops.agg_start(link_count, group_mode);   /* 멤버 스캔·연결 시작(비동기) */
+    } else {
+        ESP_LOGW(TAG, "agg_start 미등록 → 멤버 연결 불가, 0xA1(0)만 회신");
+        rcube_cmd_report_members(0);
+    }
     return RCUBE_RC_OK;
 }
 
@@ -155,34 +134,45 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
 
     ESP_LOGI(TAG, "RX frame: target=0x%02x op=0x%02x payload=%u bytes", target, op, plen);
 
+    /* 자기 대상이 아니면 → 아그리게이터일 때 멤버로 중계. */
+    if (!addr_for_me(target)) {
+        if (s_ops.forward != NULL && s_ops.forward(target, data, len) == 0) {
+            ESP_LOGI(TAG, "target 0x%02x → 멤버로 중계", target);
+        } else {
+            ESP_LOGW(TAG, "target 0x%02x 중계 불가(아그리게이터 아님/대상 없음)", target);
+            reply_cmd_ack(op, RCUBE_RC_NODE_NOT_FOUND);
+        }
+        return;
+    }
+
     uint8_t rc;
     switch (op) {
     case RCUBE_OP_SetSK6812LED:
-        rc = handle_set_led(target, payload, plen);
+        rc = handle_set_led(payload, plen);
         reply_cmd_ack(op, rc);
         break;
 
     case RCUBE_OP_SetMultiroleAggregator:
-        rc = handle_set_aggregator(target, payload, plen);
-        /* A0는 0xA1로 회신하므로 CmdAck는 실패 시에만 보낸다. */
+        rc = handle_set_aggregator(payload, plen);
+        /* 성공 시 회신은 0xA1(멤버 연결)로 대체. 실패만 CmdAck. */
         if (rc != RCUBE_RC_OK) {
             reply_cmd_ack(op, rc);
         }
         break;
 
     default:
-        ESP_LOGW(TAG, "미구현 OpCode 0x%02x (Phase 2 미지원)", op);
+        ESP_LOGW(TAG, "미구현 OpCode 0x%02x (미지원)", op);
         reply_cmd_ack(op, RCUBE_RC_BAD_OPCODE);
         break;
     }
 }
 
-void rcube_cmd_init(rcube_send_fn responder)
+void rcube_cmd_init(const rcube_cmd_ops_t *ops)
 {
-    s_send = responder;
-    if (s_lock == NULL) {
-        s_lock = xSemaphoreCreateMutex();
-        configASSERT(s_lock != NULL);
+    if (ops != NULL) {
+        s_ops = *ops;
+    } else {
+        memset(&s_ops, 0, sizeof(s_ops));
     }
-    ESP_LOGI(TAG, "command layer ready (E0/A0 구현, 그 외 CmdAck NAK)");
+    ESP_LOGI(TAG, "command layer ready (E0/A0 + 멤버 중계, 그 외 CmdAck NAK)");
 }

@@ -1,6 +1,7 @@
 #include "ble_rcube.h"
 #include "board_led.h"
 #include "rcube_cmd.h"
+#include "ble_multirole.h"
 
 #include <string.h>
 
@@ -37,10 +38,10 @@ static const char *TAG = "ble";
  * Service : 52434245-0000-1000-8000-00805f9b34fb  (ASCII "RCBE")
  * Char    : 52434245-0001-1000-8000-00805f9b34fb  (READ | WRITE | NOTIFY)
  * BLE_UUID128_INIT는 바이트를 LSB부터 나열한다(위 표기의 역순). */
-static const ble_uuid128_t rcube_svc_uuid =
+const ble_uuid128_t rcube_svc_uuid =
     BLE_UUID128_INIT(0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
                      0x00, 0x10, 0x00, 0x00, 0x45, 0x42, 0x43, 0x52);
-static const ble_uuid128_t rcube_chr_uuid =
+const ble_uuid128_t rcube_chr_uuid =
     BLE_UUID128_INIT(0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
                      0x00, 0x10, 0x01, 0x00, 0x45, 0x42, 0x43, 0x52);
 
@@ -62,7 +63,7 @@ static void try_advertise(void);
 /* ---- 회신(notify) 송신 : 명령 레이어의 responder ---------------------
  * 완성된 와이어 프레임을 현재 연결의 R큐브 특성으로 notify 한다.
  * NimBLE 호스트 태스크 컨텍스트(write 콜백)에서 호출된다. */
-static int ble_rcube_send_notify(const uint8_t *frame, uint16_t len)
+int ble_rcube_notify_pc(const uint8_t *frame, uint16_t len)
 {
     uint16_t conn;
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -233,6 +234,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_connected = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         xSemaphoreGive(s_lock);
+        /* PC 연결이 끊기면 아그리게이터 역할도 해제(멤버 전원 종료). */
+        ble_multirole_stop_aggregator();
         board_led_set(LED_IDLE_R, LED_IDLE_G, LED_IDLE_B);
         try_advertise();   /* 재연결을 위해 광고 재개 */
         return 0;
@@ -324,8 +327,14 @@ void ble_rcube_init(void)
         return;
     }
 
-    /* 명령 레이어 준비(회신은 이 특성의 notify로 나간다). */
-    rcube_cmd_init(ble_rcube_send_notify);
+    /* 명령 레이어 준비: 회신=peripheral notify, 멀티롤/중계=central 레이어. */
+    static const rcube_cmd_ops_t cmd_ops = {
+        .send      = ble_rcube_notify_pc,
+        .agg_start = ble_multirole_start_aggregator,
+        .agg_stop  = ble_multirole_stop_aggregator,
+        .forward   = ble_multirole_forward,
+    };
+    rcube_cmd_init(&cmd_ops);
 
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "BLE initialized (name=\"%s\", not advertising yet)",
@@ -347,4 +356,9 @@ bool ble_rcube_is_active(void)
     active = s_advertising || s_connected;
     xSemaphoreGive(s_lock);
     return active;
+}
+
+uint8_t ble_rcube_own_addr_type(void)
+{
+    return s_own_addr_type;
 }

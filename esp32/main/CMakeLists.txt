@@ -12,6 +12,7 @@ idf_component_register(
         "main.c"
         "board_led.c"
         "ble_rcube.c"
+        "ble_multirole.c"
         "rcube_cmd.c"
     INCLUDE_DIRS
         "."

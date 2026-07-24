@@ -14,6 +14,14 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
+
+#include "host/ble_uuid.h"
+
+/* R큐브 커스텀 GATT (peripheral 광고 / central 탐색 양쪽에서 공유).
+ *   Service 52434245-0000-... ("RCBE"), Char 52434245-0001-... (RD|WR|NOTIFY) */
+extern const ble_uuid128_t rcube_svc_uuid;
+extern const ble_uuid128_t rcube_chr_uuid;
 
 /* NimBLE 스택 초기화(광고 시작 안 함). app_main에서 1회 호출. */
 void ble_rcube_init(void);
@@ -23,3 +31,9 @@ void ble_rcube_start_advertising(void);
 
 /* 현재 광고 중이거나 연결된 상태인지. */
 bool ble_rcube_is_active(void);
+
+/* 완성된 와이어 프레임을 PC(peripheral 연결) 쪽으로 notify 회신. 성공 0. */
+int ble_rcube_notify_pc(const uint8_t *frame, uint16_t len);
+
+/* central(멤버 스캔/연결)에서 쓸 자기 주소 타입. sync 이후 유효. */
+uint8_t ble_rcube_own_addr_type(void);
