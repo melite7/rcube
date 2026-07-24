@@ -25,6 +25,7 @@
 
 #include "board_led.h"
 #include "ble_rcube.h"
+#include "rcube_config.h"
 
 static const char *TAG = "rcube";
 
@@ -99,6 +100,11 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* 영구 설정 로드(그룹번호/노드번호). 없으면 공장 디폴트로 채워 저장. */
+    rcube_config_init();
+    ESP_LOGI(TAG, "identity: group=0x%02x, node=0x%02x",
+             rcube_config_group_id(), rcube_config_node_id());
 
     /* LED 준비 후 부팅 성공 표시 → 파란색 점등. */
     board_led_init();

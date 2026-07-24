@@ -14,6 +14,7 @@ idf_component_register(
         "ble_rcube.c"
         "ble_multirole.c"
         "rcube_cmd.c"
+        "rcube_config.c"
     INCLUDE_DIRS
         "."
         # 프로토콜 단일 소스(opcode/주소/결과코드). app 과 동일 헤더를 공유.
