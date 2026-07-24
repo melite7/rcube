@@ -10,8 +10,10 @@ static const char *TAG = "status";
 
 typedef struct { uint8_t r, g, b; } rgb_t;
 
-/* 색 팔레트 RGBCMYVO (인덱스 0~7). 기획서 색상 규약. */
-static const rgb_t PALETTE[8] = {
+/* 자릿수(0~9) → 색. 0~7=RGBCMYVO(기획서), 8=연한 빨강(0의 1/2 밝기),
+ * 9=연한 초록(1의 1/2 밝기). board_led가 전역 밝기로 한 번 더 스케일하므로,
+ * 여기서 8·9는 0·1 색의 RGB를 절반으로 낮춰 "절반 밝기"를 만든다. */
+static const rgb_t PALETTE[10] = {
     {255,   0,   0},  /* 0 Red */
     {  0, 255,   0},  /* 1 Green */
     {  0,   0, 255},  /* 2 Blue */
@@ -20,6 +22,8 @@ static const rgb_t PALETTE[8] = {
     {255, 255,   0},  /* 5 Yellow */
     {148,   0, 211},  /* 6 Violet */
     {255,  90,   0},  /* 7 Orange */
+    {128,   0,   0},  /* 8 연한 Red (0의 1/2 밝기) */
+    {  0, 128,   0},  /* 9 연한 Green (1의 1/2 밝기) */
 };
 static const rgb_t WHITE = {255, 255, 255};
 static const rgb_t BLACK = {0, 0, 0};
@@ -27,13 +31,13 @@ static const rgb_t BLACK = {0, 0, 0};
 /* 연결모드 플래그(버튼 태스크에서 set, 아이덴티티 태스크에서 read). */
 static volatile bool s_connect_mode;
 
-/* 10진 자리(0~9) → 표시 색. 0~7은 팔레트, 8·9는 색 없음 → 흰색 폴백. */
+/* 10진 자리(0~9) → 표시 색. (그룹 전체가 0인 경우만 상위에서 흰색 처리) */
 static rgb_t color_for_digit(uint8_t d)
 {
-    if (d < 8) {
+    if (d < 10) {
         return PALETTE[d];
     }
-    return WHITE;
+    return WHITE;   /* 도달 불가(자리는 0~9) */
 }
 
 /* color를 ms 동안 켠다. 도중 연결모드 전환되면 즉시 true(중단) 반환. */
