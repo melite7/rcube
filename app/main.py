@@ -1,42 +1,60 @@
 """
-R큐브 PC 제어 프로그램 — 진입점 (Phase 0 스켈레톤)
+R큐브 PC 제어 프로그램 — 진입점.
 
-이 파일은 "환경이 도는지" 확인용 최소 골격이다. 실제 BLE/CAN 제어는
-Phase 4부터 채운다(shared-protocol 정의 사용).
+기본 실행하면 BLE 제어 GUI(gui.py)를 연다.
 
 실행:
-    python main.py            # 환경 확인
-    python main.py --scan     # (예정) BLE 스캔
+    python main.py            # BLE 제어 GUI 열기
+    python main.py --scan     # (GUI 없이) 콘솔에서 R큐브 스캔만
+    python main.py --check    # 실행환경(bleak 등) 설치 확인
 """
 import argparse
+import asyncio
 import sys
+
+
+def _check_env() -> int:
+    print("==== R-Cube PC tool — 환경 확인 ====")
+    print(f"python: {sys.version.split()[0]}")
+    for mod, hint in (("bleak", "BLE"), ("can", "USB-CAN"), ("tkinter", "GUI")):
+        try:
+            __import__(mod)
+            print(f"{mod}: OK ({hint})")
+        except ImportError:
+            print(f"{mod}: 미설치 — 'pip install -r requirements.txt' 필요")
+    return 0
+
+
+def _scan_console() -> int:
+    from rcube import RCubeBLE
+
+    async def run():
+        print("스캔 중… (약 5초)")
+        results = await RCubeBLE.scan(timeout=5.0)
+        if not results:
+            print("R큐브를 찾지 못했습니다. (기기 BOOT버튼으로 광고 시작했는지 확인)")
+            return
+        for i, r in enumerate(results):
+            print(f"  [{i}] {r}")
+
+    asyncio.run(run())
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="R-Cube PC control tool")
-    parser.add_argument("--scan", action="store_true",
-                        help="(예정) BLE로 R큐브 스캔")
+    parser.add_argument("--scan", action="store_true", help="GUI 없이 콘솔에서 BLE 스캔")
+    parser.add_argument("--check", action="store_true", help="실행환경(bleak/can/tkinter) 확인")
     args = parser.parse_args()
 
-    print("==== R-Cube PC tool (Phase 0 skeleton) ====")
-    print(f"python: {sys.version.split()[0]}")
-
-    try:
-        import bleak  # noqa: F401
-        print("bleak: OK")
-    except ImportError:
-        print("bleak: 미설치 — 'pip install -r requirements.txt' 필요")
-
-    try:
-        import can  # noqa: F401
-        print("python-can: OK")
-    except ImportError:
-        print("python-can: 미설치 — 'pip install -r requirements.txt' 필요")
-
+    if args.check:
+        return _check_env()
     if args.scan:
-        print("TODO(Phase4): BLE 스캔은 아직 구현 전입니다.")
+        return _scan_console()
 
-    return 0
+    # 기본: GUI
+    from gui import main as gui_main
+    return gui_main()
 
 
 if __name__ == "__main__":

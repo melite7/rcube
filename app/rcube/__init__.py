@@ -1,0 +1,54 @@
+"""
+rcube — R큐브 PC 제어 코어 (BLE 전송 + 프로토콜 프레이밍).
+
+UI(gui.py)와 스크립트가 공통으로 쓰는 재사용 계층.
+전송계층 무관 설계(로드맵 12.9)에 맞춰, 프레이밍(protocol)과
+BLE 송수신(ble)을 분리해 둔다. 나중에 CAN 어댑터도 같은 프레임을 쓴다.
+"""
+from .protocol import (
+    OpCode,
+    ResultCode,
+    ADDR_NODE_MIN,
+    ADDR_NODE_MAX,
+    ADDR_HUB,
+    ADDR_BROADCAST,
+    build_frame,
+    parse_frame,
+    Frame,
+    build_set_led,
+    build_set_led_solid,
+    build_set_aggregator,
+    RED,
+    GREEN,
+    BLUE,
+    OFF,
+    GROUP_DISABLED,
+    GROUP_ENABLED,
+    OP_AGGREGATOR_EVENT,
+)
+from .ble import RCubeBLE, ScanResult, RCUBE_NAME_PREFIX
+
+__all__ = [
+    "OpCode",
+    "ResultCode",
+    "ADDR_NODE_MIN",
+    "ADDR_NODE_MAX",
+    "ADDR_HUB",
+    "ADDR_BROADCAST",
+    "build_frame",
+    "parse_frame",
+    "Frame",
+    "build_set_led",
+    "build_set_led_solid",
+    "build_set_aggregator",
+    "RED",
+    "GREEN",
+    "BLUE",
+    "OFF",
+    "GROUP_DISABLED",
+    "GROUP_ENABLED",
+    "OP_AGGREGATOR_EVENT",
+    "RCubeBLE",
+    "ScanResult",
+    "RCUBE_NAME_PREFIX",
+]
