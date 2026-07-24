@@ -1,6 +1,7 @@
 #include "ble_multirole.h"
 #include "ble_rcube.h"
 #include "rcube_cmd.h"
+#include "rcube_buzzer.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -238,9 +239,16 @@ static int chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     /* 멤버 READY. 가상ID 부여 후 PC에 0xA1 보고. */
     m->state = SLOT_READY;
     m->vid = s_next_vid++;
+    uint8_t ready = count_ready();
     ESP_LOGI(TAG, "멤버 READY: conn=%u vid=%u chr=%u (%u/%u)",
-             conn_handle, m->vid, m->chr_val_handle, count_ready(), s_target_members);
-    rcube_cmd_report_members(count_ready());
+             conn_handle, m->vid, m->chr_val_handle, ready, s_target_members);
+    rcube_cmd_report_members(ready);
+    /* 멤버 1개 연결음, 전원 연결되면 전체 완료 멜로디. */
+    if (ready >= s_target_members) {
+        rcube_buzzer_play(RCUBE_MELODY_LINK_COMPLETED);
+    } else {
+        rcube_buzzer_play(RCUBE_MELODY_LINK);
+    }
     scan_if_needed();   /* 더 필요하면 계속 스캔 */
     return 0;
 }

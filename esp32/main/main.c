@@ -26,6 +26,8 @@
 #include "board_led.h"
 #include "ble_rcube.h"
 #include "rcube_config.h"
+#include "rcube_buzzer.h"
+#include "rcube_status.h"
 
 static const char *TAG = "rcube";
 
@@ -68,8 +70,16 @@ static void button_task(void *arg)
         if (prev == 1 && level == 0) {          /* 하강 에지 = 눌림 시작 */
             vTaskDelay(pdMS_TO_TICKS(20));       /* 디바운스 */
             if (gpio_get_level(BOOT_BTN_GPIO) == 0) {
-                ESP_LOGI(TAG, "BOOT pressed -> start BLE advertising");
-                ble_rcube_start_advertising();
+                /* 버튼음은 누를 때마다 재생. */
+                rcube_buzzer_play(RCUBE_MELODY_BUTTON_PRESSED);
+                /* 최초 눌림 = 연결모드 진입(아이덴티티 표시 중지 + 광고 시작). */
+                bool first = rcube_status_enter_connect_mode();
+                if (first) {
+                    ESP_LOGI(TAG, "BOOT pressed -> connect mode: start BLE advertising");
+                    ble_rcube_start_advertising();
+                } else {
+                    ESP_LOGI(TAG, "BOOT pressed (already in connect mode)");
+                }
                 /* 눌린 동안 대기(연속 트리거 방지) */
                 while (gpio_get_level(BOOT_BTN_GPIO) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(20));
@@ -106,13 +116,17 @@ void app_main(void)
     ESP_LOGI(TAG, "identity: group=0x%02x, node=0x%02x",
              rcube_config_group_id(), rcube_config_node_id());
 
-    /* LED 준비 후 부팅 성공 표시 → 파란색 점등. */
+    /* LED / 부저 준비. 부팅 후 LED는 그룹번호 아이덴티티 표시가 담당한다. */
     board_led_init();
-    board_led_set(0, 0, 255);   /* blue (밝기는 board_led에서 스케일) */
-    ESP_LOGI(TAG, "boot OK -> solid blue");
+    rcube_buzzer_init();
 
     /* BLE 스택 초기화(광고는 버튼을 눌러야 시작). */
     ble_rcube_init();
+
+    /* 부팅 성공: 그룹번호 색상 표시 시작 + START(시작음) 재생. */
+    rcube_status_start_identity();
+    rcube_buzzer_play(RCUBE_MELODY_START);
+    ESP_LOGI(TAG, "boot OK -> identity(group color) + START melody");
 
     /* 모션 태스크를 Core 1에 명시 핀닝 (로드맵 12.2). */
     BaseType_t motion_ret = xTaskCreatePinnedToCore(motion_task, "motion", 4096, NULL,
