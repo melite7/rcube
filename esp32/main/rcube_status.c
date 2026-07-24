@@ -10,20 +10,21 @@ static const char *TAG = "status";
 
 typedef struct { uint8_t r, g, b; } rgb_t;
 
-/* 자릿수(0~9) → 색. 0~7=RGBCMYVO(기획서), 8=연한 빨강(0의 1/2 밝기),
- * 9=연한 초록(1의 1/2 밝기). board_led가 전역 밝기로 한 번 더 스케일하므로,
- * 여기서 8·9는 0·1 색의 RGB를 절반으로 낮춰 "절반 밝기"를 만든다. */
+/* 자릿수(0~9) → 색. 기획서 노드ID 색상 규약과 맞춤(1=Red, 2=Green…).
+ *   0=White 1=Red 2=Green 3=Blue 4=Cyan 5=Magenta 6=Yellow 7=Violet 8=Orange
+ *   9=어두운 Red(Red의 1/2 밝기={128,0,0}).
+ * 자리 0이 White라 그룹 00은 자연히 흰색+흰색으로 표시된다(별도 예외 없음). */
 static const rgb_t PALETTE[10] = {
-    {255,   0,   0},  /* 0 Red */
-    {  0, 255,   0},  /* 1 Green */
-    {  0,   0, 255},  /* 2 Blue */
-    {  0, 255, 255},  /* 3 Cyan */
-    {255,   0, 255},  /* 4 Magenta */
-    {255, 255,   0},  /* 5 Yellow */
-    {148,   0, 211},  /* 6 Violet */
-    {255,  90,   0},  /* 7 Orange */
-    {128,   0,   0},  /* 8 연한 Red (0의 1/2 밝기) */
-    {  0, 128,   0},  /* 9 연한 Green (1의 1/2 밝기) */
+    {255, 255, 255},  /* 0 White */
+    {255,   0,   0},  /* 1 Red */
+    {  0, 255,   0},  /* 2 Green */
+    {  0,   0, 255},  /* 3 Blue */
+    {  0, 255, 255},  /* 4 Cyan */
+    {255,   0, 255},  /* 5 Magenta */
+    {255, 255,   0},  /* 6 Yellow */
+    {148,   0, 211},  /* 7 Violet */
+    {255,  90,   0},  /* 8 Orange */
+    {128,   0,   0},  /* 9 어두운 Red (Red의 1/2 밝기) */
 };
 static const rgb_t WHITE = {255, 255, 255};
 static const rgb_t BLACK = {0, 0, 0};
@@ -63,14 +64,9 @@ static void identity_task(void *arg)
     while (!s_connect_mode) {
         /* 매 주기 그룹번호를 다시 읽어 런타임 변경 반영. */
         uint8_t group = rcube_config_group_id();
-        rgb_t c1, c2;
-        if (group == 0) {
-            c1 = c2 = WHITE;   /* 공장초기(그룹 없음) = 흰색 */
-        } else {
-            c1 = color_for_digit(group / 10);   /* 십의자리 = 첫색(짧게) */
-            c2 = color_for_digit(group % 10);   /* 일의자리 = 둘째색(길게) */
-        }
-        /* 첫색 0.5s ON → 0.5s OFF → 둘째색 1.0s ON → 0.5s OFF */
+        rgb_t c1 = color_for_digit(group / 10);   /* 십의자리 = 첫색(짧게) */
+        rgb_t c2 = color_for_digit(group % 10);   /* 일의자리 = 둘째색(길게) */
+        /* 첫색 0.5s ON → 0.5s OFF → 둘째색 1.0s ON → 0.5s OFF (그룹 00 = 흰+흰) */
         if (show_or_abort(c1, 500))  break;
         if (show_or_abort(BLACK, 500)) break;
         if (show_or_abort(c2, 1000)) break;
