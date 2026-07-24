@@ -8,9 +8,12 @@
 
 static const char *TAG = "led";
 
-/* 보드 실물 확인 결과 RGB LED(SK6812)는 GPIO38에 연결되어 있다. */
+/* 보드 실물 확인 결과 RGB LED(SK6812)는 GPIO38에 연결. 3개 데이지체인. */
 #define LED_GPIO 38
-#define LED_COUNT 1
+#define LED_COUNT 3
+#define LED_IDX_NODE_A 0   /* 노드ID LED */
+#define LED_IDX_NODE_B 1   /* 노드ID LED */
+#define LED_IDX_GROUP  2   /* 그룹번호 LED */
 /* SK6812 데이터 라인 타이밍은 RMT(10MHz)로 정확히 생성한다(비트뱅잉 X). */
 #define LED_RMT_RES_HZ (10 * 1000 * 1000)
 
@@ -38,20 +41,44 @@ void board_led_init(void)
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &s_strip));
     s_lock = xSemaphoreCreateMutex();
     configASSERT(s_lock != NULL);
-    ESP_LOGI(TAG, "SK6812 ready on GPIO %d (RMT)", LED_GPIO);
+    ESP_LOGI(TAG, "SK6812 x%d ready on GPIO %d (RMT)", LED_COUNT, LED_GPIO);
 }
 
-void board_led_set(uint8_t r, uint8_t g, uint8_t b)
+/* 한 픽셀의 버퍼값만 갱신(refresh는 호출부에서). 뮤텍스는 상위에서 잡음. */
+static void set_pixel_locked(int idx, uint8_t r, uint8_t g, uint8_t b)
 {
-    if (s_strip == NULL) {
-        return;
-    }
-    /* 전역 밝기로 스케일(0/255 순수색을 약하게 낮춰 출력). */
     uint8_t sr = (uint16_t)r * LED_BRIGHTNESS / 255;
     uint8_t sg = (uint16_t)g * LED_BRIGHTNESS / 255;
     uint8_t sb = (uint16_t)b * LED_BRIGHTNESS / 255;
+    ESP_ERROR_CHECK(led_strip_set_pixel(s_strip, idx, sr, sg, sb));
+}
+
+void board_led_set_node(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (s_strip == NULL) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    ESP_ERROR_CHECK(led_strip_set_pixel(s_strip, 0, sr, sg, sb));
+    set_pixel_locked(LED_IDX_NODE_A, r, g, b);
+    set_pixel_locked(LED_IDX_NODE_B, r, g, b);
+    ESP_ERROR_CHECK(led_strip_refresh(s_strip));
+    xSemaphoreGive(s_lock);
+}
+
+void board_led_set_group(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (s_strip == NULL) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    set_pixel_locked(LED_IDX_GROUP, r, g, b);
+    ESP_ERROR_CHECK(led_strip_refresh(s_strip));
+    xSemaphoreGive(s_lock);
+}
+
+void board_led_set_all(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (s_strip == NULL) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    set_pixel_locked(LED_IDX_NODE_A, r, g, b);
+    set_pixel_locked(LED_IDX_NODE_B, r, g, b);
+    set_pixel_locked(LED_IDX_GROUP, r, g, b);
     ESP_ERROR_CHECK(led_strip_refresh(s_strip));
     xSemaphoreGive(s_lock);
 }

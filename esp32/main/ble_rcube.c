@@ -2,6 +2,9 @@
 #include "board_led.h"
 #include "rcube_cmd.h"
 #include "ble_multirole.h"
+#include "rcube_config.h"
+
+#include <stdio.h>
 
 #include <string.h>
 
@@ -20,8 +23,18 @@
 
 static const char *TAG = "ble";
 
-/* 외부에서 이 이름으로 R큐브를 찾는다. */
-#define RCUBE_DEVICE_NAME "RCUBE00.00"
+/* 광고 이름 규칙: "RCUBEROBOT.GG.NN" (GG=그룹번호, NN=노드ID, 각 10진 2자리).
+ * 상위(PC/허브)는 NN을 보고 노드ID 순서대로 연결할 수 있다. 접두어 "RCUBE" 유지. */
+#define RCUBE_NAME_PREFIX "RCUBEROBOT"
+
+/* 현재 설정(group/node)으로 광고 이름을 만들어 GAP 장치이름에 설정한다. */
+static void update_device_name(void)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "%s.%02u.%02u", RCUBE_NAME_PREFIX,
+             rcube_config_group_id(), rcube_config_node_id());
+    ble_svc_gap_device_name_set(name);
+}
 
 /* LED 상태색(순수 색상; 실제 밝기는 board_led의 LED_BRIGHTNESS로 스케일). */
 #define LED_IDLE_R 0
@@ -146,7 +159,8 @@ static int gatt_svr_init(void)
     if (rc != 0) {
         return rc;
     }
-    return ble_svc_gap_device_name_set(RCUBE_DEVICE_NAME);
+    update_device_name();   /* 현재 group/node로 이름 설정 */
+    return 0;
 }
 
 /* ---- 광고 ------------------------------------------------------------ */
@@ -163,6 +177,7 @@ static void adv_start(void)
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+    update_device_name();   /* 광고 직전 현재 group/node로 이름 갱신 */
     const char *name = ble_svc_gap_device_name();
     fields.name = (uint8_t *)name;
     fields.name_len = strlen(name);
@@ -187,7 +202,7 @@ static void adv_start(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_advertising = true;
     xSemaphoreGive(s_lock);
-    board_led_set(LED_ADV_R, LED_ADV_G, LED_ADV_B);
+    board_led_set_node(LED_ADV_R, LED_ADV_G, LED_ADV_B);
     ESP_LOGI(TAG, "advertising as \"%s\" (connectable)", name);
 }
 
@@ -216,7 +231,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_advertising = false;
             s_conn_handle = event->connect.conn_handle;
             xSemaphoreGive(s_lock);
-            board_led_set(LED_CONN_R, LED_CONN_G, LED_CONN_B);
+            board_led_set_node(LED_CONN_R, LED_CONN_G, LED_CONN_B);
             ESP_LOGI(TAG, "connected (handle=%d)", event->connect.conn_handle);
         } else {
             ESP_LOGW(TAG, "connect failed; status=%d, resume adv",
@@ -236,7 +251,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         xSemaphoreGive(s_lock);
         /* PC 연결이 끊기면 아그리게이터 역할도 해제(멤버 전원 종료). */
         ble_multirole_stop_aggregator();
-        board_led_set(LED_IDLE_R, LED_IDLE_G, LED_IDLE_B);
+        board_led_set_node(LED_IDLE_R, LED_IDLE_G, LED_IDLE_B);
         try_advertise();   /* 재연결을 위해 광고 재개 */
         return 0;
 
@@ -339,7 +354,7 @@ void ble_rcube_init(void)
 
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "BLE initialized (name=\"%s\", not advertising yet)",
-             RCUBE_DEVICE_NAME);
+             ble_svc_gap_device_name());
 }
 
 void ble_rcube_start_advertising(void)

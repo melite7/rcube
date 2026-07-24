@@ -84,12 +84,12 @@ static uint8_t handle_set_led(const uint8_t *p, uint16_t len)
         return RCUBE_RC_BAD_LENGTH;
     }
     if (n == 0) {
-        board_led_set(0, 0, 0);   /* 소등 */
+        board_led_set_node(0, 0, 0);   /* 노드LED 소등 */
         ESP_LOGI(TAG, "SetSK6812LED: n=0 → off");
         return RCUBE_RC_OK;
     }
-    uint8_t r = p[1], g = p[2], b = p[3];   /* LED0 색을 대표로 사용 */
-    board_led_set(r, g, b);
+    uint8_t r = p[1], g = p[2], b = p[3];   /* LED0 색을 대표로 사용(노드LED에 적용) */
+    board_led_set_node(r, g, b);
     ESP_LOGI(TAG, "SetSK6812LED: n=%u, led0=(%u,%u,%u) → 온보드 점등", n, r, g, b);
     return RCUBE_RC_OK;
 }
@@ -104,13 +104,14 @@ static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
     }
     uint8_t link_count = p[0];
     uint8_t group_mode = p[1];
+    uint8_t flags = (len >= 3) ? p[2] : 0;   /* bit0=순서고정 연결(NN 오름차순) */
 
-    board_led_set(255, 0, 0);   /* 아그리게이터 표시 = 빨강(순수색, 밝기는 board_led) */
-    ESP_LOGI(TAG, "SetMultiroleAggregator: total=%u, group_mode=0x%02x → 아그리게이터 승격(RED)",
-             link_count, group_mode);
+    board_led_set_node(255, 0, 0);   /* 아그리게이터 = 노드1 = Red(노드LED) */
+    ESP_LOGI(TAG, "SetMultiroleAggregator: total=%u, group_mode=0x%02x, flags=0x%02x → 승격(RED)",
+             link_count, group_mode, flags);
 
     if (s_ops.agg_start != NULL) {
-        s_ops.agg_start(link_count, group_mode);   /* 멤버 스캔·연결 시작(비동기) */
+        s_ops.agg_start(link_count, group_mode, flags);   /* 멤버 스캔·연결 시작(비동기) */
     } else {
         ESP_LOGW(TAG, "agg_start 미등록 → 멤버 연결 불가, 0xA1(0)만 회신");
         rcube_cmd_report_members(0);
@@ -141,21 +142,41 @@ static void schedule_reboot(void)
     xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
 }
 
-/* D3 SetNodeConfig: payload=[group_id]. 그룹번호를 NVS에 저장하고 재부팅.
- * (계약: 지금은 group_id 1바이트. 추후 node_id 등 필드 확장 가능.) */
-static uint8_t handle_set_node_config(const uint8_t *p, uint16_t len)
+/* D3 SetNodeConfig 서브커맨드 처리(payload[0]=subcmd). target은 브로드캐스트 여부 판단용. */
+static uint8_t handle_set_node_config(uint8_t target, const uint8_t *p, uint16_t plen)
 {
-    if (len < 1) {
+    if (plen < 1) {
         return RCUBE_RC_BAD_LENGTH;
     }
-    uint8_t group = p[0];
-    esp_err_t err = rcube_config_set_group_id(group);
-    if (err != ESP_OK) {
-        return RCUBE_RC_FLASH_FAIL;
+    uint8_t sub = p[0];
+    switch (sub) {
+    case RCUBE_D3_SUB_SET_GROUP: {
+        if (plen < 2) return RCUBE_RC_BAD_LENGTH;
+        if (rcube_config_set_group_id(p[1]) != ESP_OK) return RCUBE_RC_FLASH_FAIL;
+        ESP_LOGI(TAG, "D3 SET_GROUP: group_id=0x%02x 저장 → 재부팅", p[1]);
+        schedule_reboot();
+        return RCUBE_RC_OK;
     }
-    ESP_LOGI(TAG, "SetNodeConfig: group_id=0x%02x 저장", group);
-    schedule_reboot();
-    return RCUBE_RC_OK;
+    case RCUBE_D3_SUB_SET_NODE: {
+        if (plen < 2) return RCUBE_RC_BAD_LENGTH;
+        if (rcube_config_set_node_id(p[1]) != ESP_OK) return RCUBE_RC_FLASH_FAIL;
+        ESP_LOGI(TAG, "D3 SET_NODE: node_id=0x%02x 저장 → 재부팅", p[1]);
+        schedule_reboot();
+        return RCUBE_RC_OK;
+    }
+    case RCUBE_D3_SUB_FIX_ORDER: {
+        /* 이 큐브(아그리게이터/첫 큐브)는 노드1로 저장. 멤버들은 아그리게이터가
+         * 각자 가상ID를 노드ID로 저장시킨다(ops.fix_order). 전체 재부팅. */
+        if (rcube_config_set_node_id(1) != ESP_OK) return RCUBE_RC_FLASH_FAIL;
+        int members = (s_ops.fix_order != NULL) ? s_ops.fix_order() : 0;
+        ESP_LOGI(TAG, "D3 FIX_ORDER: 자기=노드1, 멤버 %d개에 순서 저장 지시 → 재부팅", members);
+        schedule_reboot();
+        return RCUBE_RC_OK;
+    }
+    default:
+        ESP_LOGW(TAG, "D3 알 수 없는 subcmd 0x%02x", sub);
+        return RCUBE_RC_BAD_PARAM;
+    }
 }
 
 /* ---- 파서 + 디스패처 ------------------------------------------------- */
@@ -205,11 +226,11 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
         break;
 
     case RCUBE_OP_SetNodeConfig:
-        /* 브로드캐스트면 아그리게이터가 먼저 전 멤버로 중계(멤버도 저장+재부팅). */
+        /* 브로드캐스트(예: SET_GROUP)면 아그리게이터가 먼저 전 멤버로 그대로 중계. */
         if (target == RCUBE_ADDR_BROADCAST && s_ops.forward_all != NULL) {
             s_ops.forward_all(data, len);
         }
-        rc = handle_set_node_config(payload, plen);
+        rc = handle_set_node_config(target, payload, plen);
         reply_cmd_ack(op, rc);
         break;
 

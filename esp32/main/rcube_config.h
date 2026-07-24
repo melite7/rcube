@@ -18,7 +18,7 @@
 
 /* 공장 디폴트값 (일단 이 값으로 저장; 추후 조정 가능). */
 #define RCUBE_DEFAULT_GROUP_ID  0x00u   /* 0 = 미지정(그룹 없음) */
-#define RCUBE_DEFAULT_NODE_ID   0x01u   /* 1 = RCUBE_ADDR_NODE_MIN */
+#define RCUBE_DEFAULT_NODE_ID   0x00u   /* 0 = 미할당(공장 출하값). 순서고정 시 1~8 저장 */
 
 /* NVS에서 설정을 로드한다. 값이 없으면 공장 디폴트로 채워 저장한다.
  * app_main 초기화(nvs_flash_init 이후)에서 1회 호출. */

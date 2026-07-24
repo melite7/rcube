@@ -24,11 +24,21 @@ typedef int (*rcube_send_fn)(const uint8_t *frame, uint16_t len);
 /* 명령 레이어가 전송계층에 위임하는 동작들. NULL이면 해당 기능 미지원. */
 typedef struct {
     rcube_send_fn send;                                  /* PC로 프레임 회신 */
-    void (*agg_start)(uint8_t link_count, uint8_t group_mode); /* 아그리게이터 승격 */
+    void (*agg_start)(uint8_t link_count, uint8_t group_mode, uint8_t flags); /* 아그리게이터 승격 */
     void (*agg_stop)(void);                              /* 아그리게이터 해제 */
     int  (*forward)(uint8_t target_id, const uint8_t *frame, uint16_t len); /* 멤버 중계 */
     int  (*forward_all)(const uint8_t *frame, uint16_t len);  /* 전 멤버로 브로드캐스트 중계 */
+    int  (*fix_order)(void);   /* 순서고정: 각 멤버에 자기 가상ID를 노드ID로 저장시킴 */
 } rcube_cmd_ops_t;
+
+/* ---- SetNodeConfig(D3) 서브커맨드 (payload[0]) — 펌웨어/앱 공유 계약 ----
+ *   SET_GROUP : payload=[0x01, group_id]  그룹번호 저장 후 재부팅(브로드캐스트 팬아웃)
+ *   FIX_ORDER : payload=[0x02]            자기=노드1 저장 + 아그리게이터가 멤버들에
+ *                                          각자 가상ID를 노드ID로 저장시킴, 전체 재부팅
+ *   SET_NODE  : payload=[0x03, node_id]   노드ID 저장 후 재부팅(아그리게이터→멤버 or 단일) */
+#define RCUBE_D3_SUB_SET_GROUP  0x01u
+#define RCUBE_D3_SUB_FIX_ORDER  0x02u
+#define RCUBE_D3_SUB_SET_NODE   0x03u
 
 /* 명령 레이어 초기화. ops 는 호출 이후에도 유효한 저장소를 가리켜야 한다. */
 void rcube_cmd_init(const rcube_cmd_ops_t *ops);

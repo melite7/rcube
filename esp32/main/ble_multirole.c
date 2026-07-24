@@ -42,13 +42,16 @@ typedef struct {
     uint16_t     svc_end;
     uint16_t     chr_val_handle;
     uint8_t      vid;          /* PC와 맞춘 가상 노드 ID(2..N) */
+    uint8_t      nn;           /* 광고이름에서 읽은 노드ID(순서고정 연결용) */
 } member_t;
 
 /* --- 상태 (모두 NimBLE 호스트 태스크 단일 스레드에서만 접근) --- */
 static bool     s_active;
 static uint8_t  s_target_members;   /* 연결해야 할 멤버 수 = link_count-1 */
 static uint8_t  s_group_mode;
-static uint8_t  s_next_vid;         /* 다음 멤버에 부여할 가상ID(2부터) */
+static bool     s_ordered;          /* 순서고정 연결(NN 오름차순) */
+static uint8_t  s_next_nn;          /* 순서고정 시 다음에 연결할 NN(2부터) */
+static uint8_t  s_next_vid;         /* 비순서 시 다음 멤버 가상ID(2부터) */
 static bool     s_connect_pending;  /* 연결 시도 1건 진행 중(직렬화) */
 static member_t s_members[MAX_MEMBERS];
 
@@ -95,6 +98,34 @@ static void free_slot(member_t *m)
     m->state = SLOT_FREE;
 }
 
+/* 광고이름 "RCUBEROBOT.GG.NN"에서 NN(마지막 '.' 뒤 10진)을 뽑는다. */
+static bool parse_name_nn(const uint8_t *name, uint8_t len, uint8_t *out)
+{
+    if (name == NULL || len == 0) {
+        return false;
+    }
+    int lastdot = -1;
+    for (int i = 0; i < len; i++) {
+        if (name[i] == '.') lastdot = i;
+    }
+    if (lastdot < 0) {
+        return false;
+    }
+    int v = 0;
+    bool any = false;
+    for (int i = lastdot + 1; i < len; i++) {
+        char c = (char)name[i];
+        if (c < '0' || c > '9') break;
+        v = v * 10 + (c - '0');
+        any = true;
+    }
+    if (!any) {
+        return false;
+    }
+    *out = (uint8_t)v;
+    return true;
+}
+
 static bool addr_known(const ble_addr_t *a)
 {
     for (int i = 0; i < MAX_MEMBERS; i++) {
@@ -128,7 +159,7 @@ static void scan_if_needed(void)
 }
 
 /* ---- 공개 API -------------------------------------------------------- */
-void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode)
+void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode, uint8_t flags)
 {
     /* 기존 아그리게이터 상태가 있으면 먼저 정리. */
     ble_multirole_stop_aggregator();
@@ -142,10 +173,13 @@ void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode)
     s_active = true;
     s_target_members = members;
     s_group_mode = group_mode;
-    s_next_vid = 2;             /* 아그리게이터=1(0xFE), 멤버는 2부터 */
+    s_ordered = (flags & RCUBE_AGG_FLAG_ORDERED) != 0;
+    s_next_nn = 2;             /* 순서고정 시 멤버 NN은 2부터 */
+    s_next_vid = 2;            /* 아그리게이터=1(0xFE), 멤버는 2부터 */
     s_connect_pending = false;
 
-    ESP_LOGI(TAG, "aggregator 시작: 목표 멤버 %u대(group_mode=0x%02x)", members, group_mode);
+    ESP_LOGI(TAG, "aggregator 시작: 목표 멤버 %u대(group_mode=0x%02x, %s)",
+             members, group_mode, s_ordered ? "순서고정 NN순" : "연결순");
 
     if (members == 0) {
         rcube_cmd_report_members(0);   /* R1 상당 — 멤버 없음 */
@@ -175,6 +209,8 @@ void ble_multirole_stop_aggregator(void)
     }
     s_target_members = 0;
     s_next_vid = 2;
+    s_next_nn = 2;
+    s_ordered = false;
 }
 
 int ble_multirole_forward(uint8_t target_id, const uint8_t *frame, uint16_t len)
@@ -240,6 +276,37 @@ int ble_multirole_broadcast(const uint8_t *frame, uint16_t len)
     return sent;
 }
 
+int ble_multirole_fix_order(void)
+{
+    if (!s_active) {
+        return -1;
+    }
+    int sent = 0;
+    for (int i = 0; i < MAX_MEMBERS; i++) {
+        member_t *m = &s_members[i];
+        if (m->state != SLOT_READY) {
+            continue;
+        }
+        /* D3 SET_NODE 프레임: 이 멤버의 가상ID를 노드ID로 저장시킨다. */
+        uint8_t f[6];
+        uint16_t total = sizeof(f);
+        f[0] = RCUBE_ADDR_HUB;      /* 멤버가 자기 명령으로 처리 */
+        f[1] = RCUBE_OP_SetNodeConfig;
+        f[2] = (uint8_t)((total >> 8) & 0xFF);
+        f[3] = (uint8_t)(total & 0xFF);
+        f[4] = RCUBE_D3_SUB_SET_NODE;
+        f[5] = m->vid;              /* 저장할 노드ID = 가상ID */
+        int rc = ble_gattc_write_flat(m->conn_handle, m->chr_val_handle, f, total, NULL, NULL);
+        if (rc == 0) {
+            sent++;
+            ESP_LOGI(TAG, "fix_order: vid=%u 멤버에 노드ID 저장 지시", m->vid);
+        } else {
+            ESP_LOGW(TAG, "fix_order: vid=%u write 실패 rc=%d", m->vid, rc);
+        }
+    }
+    return sent;
+}
+
 uint8_t ble_multirole_member_count(void)
 {
     return count_ready();
@@ -268,7 +335,8 @@ static int chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     }
     /* 멤버 READY. 가상ID 부여 후 PC에 0xA1 보고. */
     m->state = SLOT_READY;
-    m->vid = s_next_vid++;
+    /* 순서고정이면 광고이름 NN을 그대로 가상ID로, 아니면 연결순서(2,3,…). */
+    m->vid = (s_ordered && m->nn >= 2) ? m->nn : s_next_vid++;
     uint8_t ready = count_ready();
     ESP_LOGI(TAG, "멤버 READY: conn=%u vid=%u chr=%u (%u/%u)",
              conn_handle, m->vid, m->chr_val_handle, ready, s_target_members);
@@ -385,6 +453,13 @@ static int disc_gap_event(struct ble_gap_event *event, void *arg)
         memcmp(fields.name, RCUBE_NAME_PREFIX, RCUBE_NAME_PREFIX_LEN) != 0) {
         return 0;
     }
+    uint8_t nn = 0;
+    bool have_nn = parse_name_nn(fields.name, fields.name_len, &nn);
+
+    /* 순서고정 연결: 지금 필요한 NN(s_next_nn)과 정확히 같은 큐브만 연결. */
+    if (s_ordered && (!have_nn || nn != s_next_nn)) {
+        return 0;
+    }
     if (addr_known(&event->disc.addr)) {
         return 0;   /* 이미 연결(시도)한 기기 */
     }
@@ -401,6 +476,7 @@ static int disc_gap_event(struct ble_gap_event *event, void *arg)
     }
     m->state = SLOT_CONNECTING;
     m->addr = event->disc.addr;
+    m->nn = have_nn ? nn : 0;
 
     uint8_t own_addr_type = ble_rcube_own_addr_type();
     int rc = ble_gap_connect(own_addr_type, &event->disc.addr, 10000 /*ms*/,
@@ -411,6 +487,9 @@ static int disc_gap_event(struct ble_gap_event *event, void *arg)
         s_connect_pending = false;
         scan_if_needed();
     } else {
+        if (s_ordered) {
+            s_next_nn++;   /* 다음 순번으로 진행 */
+        }
         char addr_str[18];
         const uint8_t *a = event->disc.addr.val;
         snprintf(addr_str, sizeof(addr_str), "%02x:%02x:%02x:%02x:%02x:%02x",
