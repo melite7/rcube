@@ -28,7 +28,8 @@ from rcube import (
     build_frame,
     build_set_led_solid,
     build_set_aggregator,
-    build_set_node_config,
+    build_set_group,
+    build_fix_order,
     parse_frame,
     ADDR_HUB,
     ADDR_BROADCAST,
@@ -61,6 +62,16 @@ class AsyncLoop:
 # ----------------------------------------------------------------------------
 # 시나리오 버튼 색상
 # ----------------------------------------------------------------------------
+def _parse_nn(name: str):
+    """광고이름 'RCUBEROBOT.GG.NN'에서 노드번호(NN)를 정수로. 실패 시 None."""
+    if not name:
+        return None
+    try:
+        return int(name.rsplit(".", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 BTN_IDLE = {"bg": "#b8b8b8", "fg": "#000000", "activebackground": "#a8a8a8"}
 BTN_BUSY = {"bg": "#e69500", "fg": "#ffffff", "activebackground": "#cf8600"}
 BTN_DONE = {"bg": "#111111", "fg": "#ffffff", "activebackground": "#333333"}
@@ -87,6 +98,7 @@ class RCubeApp:
         self.scn_total = 0        # 본인 포함 목표 큐브 수 N
         self.scn_members = 0      # 현재 연결된 멤버 수(아그리게이터 제외)
         self.scn_done = False     # 완료(검정) 여부
+        self.scn_ordered = False  # 이번 시나리오가 순서고정 연결인지(시작 시 캡처)
         self.r_btns: dict[int, tk.Button] = {}
 
         root.title("R-Cube BLE 제어")
@@ -118,6 +130,15 @@ class RCubeApp:
         self.status_var = tk.StringVar(value="● 대기")
         self.status_lbl = ttk.Label(scn, textvariable=self.status_var)
         self.status_lbl.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+
+        # 순서고정 옵션 + 순서고정하기 버튼
+        self.ordered_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(scn, text="순서고정으로 연결 (노드ID 순서대로)",
+                        variable=self.ordered_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        self.fix_btn = tk.Button(scn, text="순서고정하기", command=self.on_fix_order,
+                                 state="disabled")
+        self.fix_btn.grid(row=2, column=2, columnspan=2, sticky="e", padx=8, pady=(0, 6))
 
         # 2) 그룹번호 설정
         grpf = ttk.LabelFrame(self.root, text="그룹번호 설정 (연결된 모든 큐브에 저장 후 재부팅)")
@@ -196,6 +217,9 @@ class RCubeApp:
         if self.active is None:
             for n, b in self.r_btns.items():
                 b.configure(text=f"R{n}")
+        # 순서고정하기: R2~R4가 모두 연결(완료)됐을 때만 활성.
+        fix_on = (self.active is not None and self.active >= 2 and self.scn_done)
+        self.fix_btn.configure(state="normal" if fix_on else "disabled")
 
     # =====================================================================
     # 코루틴 실행 헬퍼
@@ -236,22 +260,37 @@ class RCubeApp:
         self.scn_total = n
         self.scn_members = 0
         self.scn_done = False
+        self.scn_ordered = bool(self.ordered_var.get())   # UI 스레드에서 캡처
         self._paint_buttons()
-        self._log(f"[R{n}] 시작 — 본인 포함 총 {n}대 목표", "scn")
+        mode = "순서고정" if self.scn_ordered else "연결순"
+        self._log(f"[R{n}] 시작 — 본인 포함 총 {n}대 목표 ({mode})", "scn")
         self._run_scn(n, self._scn_start(n))
 
     async def _scn_start(self, n: int) -> None:
-        # 1) R큐브 1대(아그리게이터/단일) 자동 연결
-        await self.ble.connect(None)
+        ordered = self.scn_ordered
+        # 1) R큐브 1대(아그리게이터/단일) 연결. 순서고정이면 NN=01(노드1) 큐브를 고른다.
+        if n >= 2 and ordered:
+            results = await RCubeBLE.scan(timeout=5.0)
+            addr = None
+            for r in results:
+                if _parse_nn(r.name) == 1:
+                    addr = r.address
+                    break
+            if addr is None:
+                raise RuntimeError("순서고정 연결: 노드ID 1(RCUBEROBOT.GG.01) 큐브를 찾지 못했습니다.")
+            self.ui_q.put(("log", f"[scn] 순서고정: 노드1 큐브 연결 → {addr}"))
+            await self.ble.connect(addr)
+        else:
+            await self.ble.connect(None)
         # 2) 그 큐브를 빨강으로
         await self.ble.send(build_set_led_solid(ADDR_HUB, RED))
         self.ui_q.put(("log", "[scn] 아그리게이터 후보 → 빨강 LED"))
         if n == 1:
             self.ui_q.put(("scn_done", n))
             return
-        # 3) 아그리게이터로 승격 + 총 큐브 수 통지(비고정형=그룹무관)
-        await self.ble.send(build_set_aggregator(n, group_enabled=False))
-        self.ui_q.put(("log", f"[scn] SetMultiroleAggregator 전송(총 {n}대). 멤버 0/{n-1} 연결 대기…"))
+        # 3) 아그리게이터로 승격 + 총 큐브 수 통지(비고정형=그룹무관, 순서고정 여부 전달)
+        await self.ble.send(build_set_aggregator(n, group_enabled=False, ordered=ordered))
+        self.ui_q.put(("log", f"[scn] SetMultiroleAggregator 전송(총 {n}대, {'NN순' if ordered else '연결순'}). 멤버 0/{n-1} 대기…"))
 
     def _teardown_scenario(self) -> None:
         n = self.active
@@ -389,8 +428,19 @@ class RCubeApp:
             self._log("[그룹] 그룹번호는 0~99 범위여야 합니다.", "err")
             return
         self._log(f"[그룹] 그룹번호 {group:02d} 적용 → 브로드캐스트 전송(저장 후 재부팅, 연결 끊김 예상)", "scn")
-        frame = build_set_node_config(group, target_id=ADDR_BROADCAST)
+        frame = build_set_group(group, target_id=ADDR_BROADCAST)
         self._run(self.ble.send(frame))   # 큐브가 CmdAck 후 ~0.8s 뒤 재부팅
+
+    def on_fix_order(self) -> None:
+        """순서고정하기: 첫 큐브(아그리게이터)에 FIX_ORDER 전송 → 각 큐브가 순서를 노드ID로 저장 후 재부팅."""
+        if self.active is None or not self.scn_done or self.scn_total < 2:
+            self._log("[순서고정] R2~R4가 모두 연결된 상태에서만 가능합니다.", "err")
+            return
+        if not self.ble.is_connected:
+            self._log("[순서고정] 연결이 없습니다.", "err")
+            return
+        self._log("[순서고정] FIX_ORDER 전송 → 각 큐브가 현재 순서를 노드ID로 저장 후 재부팅(연결 끊김)", "scn")
+        self._run(self.ble.send(build_fix_order()))
 
     def on_send(self) -> None:
         sel = self.op_cb.get()

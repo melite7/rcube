@@ -141,34 +141,56 @@ def build_set_led_solid(target_id: int, rgb, n: int = 3) -> bytes:
     return build_set_led(target_id, [(r, g, b)] * n)
 
 
-def build_set_node_config(group_id: int, *, target_id: int = ADDR_BROADCAST) -> bytes:
-    """SetNodeConfig(0xD3). 노드 영구설정 갱신 — 지금은 그룹번호만.
+# ---- SetNodeConfig(0xD3) 서브커맨드 (펌웨어 rcube_cmd.h와 일치) ----
+D3_SUB_SET_GROUP = 0x01   # payload=[0x01, group_id] : 그룹 저장 후 재부팅
+D3_SUB_FIX_ORDER = 0x02   # payload=[0x02]           : 순서고정(각 큐브가 순서를 노드ID로) + 재부팅
+D3_SUB_SET_NODE = 0x03    # payload=[0x03, node_id]  : 노드ID 저장 후 재부팅
 
-    payload = [group_id]  (계약: 1바이트. 추후 node_id 등 확장)
-    target_id 기본=브로드캐스트(0xFF): 연결된 큐브가 아그리게이터면 전 멤버로 중계된다.
-    큐브는 그룹번호를 플래시에 저장한 뒤 스스로 재부팅한다.
+
+def build_set_group(group_id: int, *, target_id: int = ADDR_BROADCAST) -> bytes:
+    """SetNodeConfig/SET_GROUP. 그룹번호를 저장시키고 큐브를 재부팅시킨다.
+
+    payload = [SET_GROUP, group_id]. 기본 브로드캐스트(0xFF): 연결된 큐브가
+    아그리게이터면 전 멤버로 중계 → 모든 큐브가 저장 후 재부팅.
     """
-    if not 0 <= group_id <= 0xFF:
-        raise ValueError(f"group_id 범위 초과: {group_id}")
-    return build_frame(target_id, OpCode.SetNodeConfig, bytes((group_id & 0xFF,)))
+    if not 0 <= group_id <= 99:
+        raise ValueError(f"group_id 범위(0~99) 초과: {group_id}")
+    payload = bytes((D3_SUB_SET_GROUP, group_id & 0xFF))
+    return build_frame(target_id, OpCode.SetNodeConfig, payload)
+
+
+def build_fix_order(*, target_id: int = ADDR_HUB) -> bytes:
+    """SetNodeConfig/FIX_ORDER. 첫 큐브(아그리게이터, 0xFE)에 보낸다.
+
+    payload = [FIX_ORDER]. 아그리게이터는 자기=노드1로, 각 멤버는 자기 가상ID(연결
+    순서 색상)를 노드ID로 저장한 뒤 전 큐브가 재부팅한다.
+    """
+    return build_frame(target_id, OpCode.SetNodeConfig, bytes((D3_SUB_FIX_ORDER,)))
+
+
+# SetMultiroleAggregator flags (payload[2])
+AGG_FLAG_ORDERED = 0x01   # 멤버를 광고이름 NN 오름차순으로 연결(순서고정 연결)
 
 
 def build_set_aggregator(
     connection_link_count: int,
     *,
     group_enabled: bool = False,
+    ordered: bool = False,
     virtual_ids=None,
     target_id: int = ADDR_HUB,
 ) -> bytes:
     """SetMultiroleAggregator(0xA0). 이 큐브를 BLE 허브(아그리게이터)로 승격.
 
-    payload = [ConnectionLinkCount][GroupMode] (+ 고정형이면 VirtualCubeId 4B×n)
+    payload = [ConnectionLinkCount][GroupMode][Flags] (+ 고정형이면 VirtualCubeId 4B×n)
     - connection_link_count : 연결 대상 큐브 수(계약상 아그리게이터 포함 총 N)
     - group_enabled=False   : GROUP_DISABLED(0x0A) 비고정형(그룹 무관)
+    - ordered=True          : AGG_FLAG_ORDERED — 멤버를 NN 순서대로 연결
     - virtual_ids           : 고정형일 때만. 각 4바이트(big-endian).
     """
     mode = GROUP_ENABLED if group_enabled else GROUP_DISABLED
-    payload = bytearray((connection_link_count & 0xFF, mode))
+    flags = AGG_FLAG_ORDERED if ordered else 0x00
+    payload = bytearray((connection_link_count & 0xFF, mode, flags))
     if virtual_ids:
         for vid in virtual_ids:
             payload += int(vid).to_bytes(4, "big")
