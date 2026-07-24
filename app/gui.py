@@ -28,6 +28,7 @@ from rcube import (
     build_frame,
     build_set_led_solid,
     build_set_aggregator,
+    build_set_node_config,
     parse_frame,
     ADDR_HUB,
     ADDR_BROADCAST,
@@ -118,7 +119,19 @@ class RCubeApp:
         self.status_lbl = ttk.Label(scn, textvariable=self.status_var)
         self.status_lbl.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
 
-        # 2) 로그
+        # 2) 그룹번호 설정
+        grpf = ttk.LabelFrame(self.root, text="그룹번호 설정 (연결된 모든 큐브에 저장 후 재부팅)")
+        grpf.pack(fill="x", **pad)
+        ttk.Label(grpf, text="그룹번호 (0~99, 0=공장초기)").grid(row=0, column=0, sticky="e", padx=6, pady=6)
+        self.group_var = tk.StringVar(value="1")
+        ttk.Entry(grpf, textvariable=self.group_var, width=6).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Button(grpf, text="그룹번호 적용", command=self.on_apply_group).grid(
+            row=0, column=2, padx=8, pady=6)
+        ttk.Label(grpf, text="※ 적용 시 큐브들이 재부팅되어 연결이 끊어집니다.").grid(
+            row=0, column=3, sticky="w", padx=6)
+        grpf.columnconfigure(3, weight=1)
+
+        # 3) 로그
         logf = ttk.LabelFrame(self.root, text="로그")
         logf.pack(fill="both", expand=True, **pad)
         self.log = tk.Text(logf, height=14, wrap="none", state="disabled",
@@ -132,7 +145,7 @@ class RCubeApp:
         self.log.tag_config("scn", foreground="#fd6")
         self.log.tag_config("err", foreground="#f66")
 
-        # 3) 디버그(수동 제어)
+        # 4) 디버그(수동 제어)
         dbg = ttk.LabelFrame(self.root, text="디버그 — 수동 스캔·전송")
         dbg.pack(fill="x", **pad)
 
@@ -360,6 +373,24 @@ class RCubeApp:
 
     def on_disconnect(self) -> None:
         self._run(self.ble.disconnect())
+
+    def on_apply_group(self) -> None:
+        """그룹번호를 연결된 큐브(+아그리게이터 멤버)에 브로드캐스트로 저장시키고 재부팅."""
+        if not self.ble.is_connected:
+            self._log("[그룹] 먼저 큐브에 연결하세요.", "err")
+            return
+        txt = self.group_var.get().strip()
+        try:
+            group = int(txt, 10)
+        except ValueError:
+            self._log("[그룹] 그룹번호는 0~99 정수여야 합니다.", "err")
+            return
+        if not 0 <= group <= 99:
+            self._log("[그룹] 그룹번호는 0~99 범위여야 합니다.", "err")
+            return
+        self._log(f"[그룹] 그룹번호 {group:02d} 적용 → 브로드캐스트 전송(저장 후 재부팅, 연결 끊김 예상)", "scn")
+        frame = build_set_node_config(group, target_id=ADDR_BROADCAST)
+        self._run(self.ble.send(frame))   # 큐브가 CmdAck 후 ~0.8s 뒤 재부팅
 
     def on_send(self) -> None:
         sel = self.op_cb.get()

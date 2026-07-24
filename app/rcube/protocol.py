@@ -141,6 +141,18 @@ def build_set_led_solid(target_id: int, rgb, n: int = 3) -> bytes:
     return build_set_led(target_id, [(r, g, b)] * n)
 
 
+def build_set_node_config(group_id: int, *, target_id: int = ADDR_BROADCAST) -> bytes:
+    """SetNodeConfig(0xD3). 노드 영구설정 갱신 — 지금은 그룹번호만.
+
+    payload = [group_id]  (계약: 1바이트. 추후 node_id 등 확장)
+    target_id 기본=브로드캐스트(0xFF): 연결된 큐브가 아그리게이터면 전 멤버로 중계된다.
+    큐브는 그룹번호를 플래시에 저장한 뒤 스스로 재부팅한다.
+    """
+    if not 0 <= group_id <= 0xFF:
+        raise ValueError(f"group_id 범위 초과: {group_id}")
+    return build_frame(target_id, OpCode.SetNodeConfig, bytes((group_id & 0xFF,)))
+
+
 def build_set_aggregator(
     connection_link_count: int,
     *,
