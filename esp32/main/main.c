@@ -28,6 +28,7 @@
 #include "rcube_config.h"
 #include "rcube_buzzer.h"
 #include "rcube_status.h"
+#include "bmi088.h"
 
 static const char *TAG = "rcube";
 
@@ -47,6 +48,26 @@ static void motion_task(void *arg)
             ESP_LOGI(TAG, "[core%d] motion tick %lu", xPortGetCoreID(), (unsigned long)tick);
         }
         tick++;
+        vTaskDelayUntil(&last, period);
+    }
+}
+
+/* IMU(BMI088) 주기 읽기 태스크(스캐폴딩). 센서가 검출된 경우에만 기동.
+ * 로드맵상 실시간 센서수집은 Core1이지만, 여기선 환경 검증용 저속 로깅(2Hz). */
+static void imu_task(void *arg)
+{
+    const TickType_t period = pdMS_TO_TICKS(500);
+    TickType_t last = xTaskGetTickCount();
+    while (1) {
+        int16_t ax, ay, az, gx, gy, gz;
+        if (bmi088_read_accel_raw(&ax, &ay, &az) == ESP_OK &&
+            bmi088_read_gyro_raw(&gx, &gy, &gz) == ESP_OK) {
+            ESP_LOGI(TAG, "IMU acc[mg]=(%.0f,%.0f,%.0f) gyro[dps]=(%.1f,%.1f,%.1f)",
+                     bmi088_accel_mg(ax), bmi088_accel_mg(ay), bmi088_accel_mg(az),
+                     bmi088_gyro_dps(gx), bmi088_gyro_dps(gy), bmi088_gyro_dps(gz));
+        } else {
+            ESP_LOGW(TAG, "IMU 읽기 실패");
+        }
         vTaskDelayUntil(&last, period);
     }
 }
@@ -127,6 +148,14 @@ void app_main(void)
     rcube_status_start_identity();
     rcube_buzzer_play(RCUBE_MELODY_START);
     ESP_LOGI(TAG, "boot OK -> identity(group color) + START melody");
+
+    /* IMU(BMI088) SPI 환경 준비 + 검증. 검출되면 주기 읽기 태스크 기동. */
+    bmi088_init();
+    if (bmi088_present()) {
+        xTaskCreatePinnedToCore(imu_task, "imu", 3072, NULL, 5, NULL, 1 /* core 1 */);
+    } else {
+        ESP_LOGW(TAG, "IMU 미검출 → 읽기 태스크 생략(환경만 준비됨)");
+    }
 
     /* 모션 태스크를 Core 1에 명시 핀닝 (로드맵 12.2). */
     BaseType_t motion_ret = xTaskCreatePinnedToCore(motion_task, "motion", 4096, NULL,
