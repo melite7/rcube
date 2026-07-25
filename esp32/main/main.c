@@ -29,6 +29,7 @@
 #include "rcube_buzzer.h"
 #include "rcube_status.h"
 #include "bmi088.h"
+#include "can_transport.h"
 
 static const char *TAG = "rcube";
 
@@ -138,11 +139,6 @@ void app_main(void)
              rcube_config_group_id(), rcube_config_node_id(),
              rcube_config_cmf(), rcube_config_cmf() ? "CAN" : "BLE",
              rcube_config_term_id());
-    if (rcube_config_cmf() == 1) {
-        /* CMF=CAN: 기획서상 CAN 부팅/하트비트로 동작해야 하나 TWAI 미구현.
-         * 개발 중 벽돌화 방지를 위해 임시로 BLE 경로를 유지한다(후속: CAN 스택). */
-        ESP_LOGW(TAG, "CMF=CAN 선택됨 — TWAI 미구현 → 임시 BLE 폴백(추후 CAN 구현 필요)");
-    }
 
     /* LED / 부저 준비. 부팅 후 LED는 그룹번호 아이덴티티 표시가 담당한다. */
     board_led_init();
@@ -162,6 +158,16 @@ void app_main(void)
         xTaskCreatePinnedToCore(imu_task, "imu", 3072, NULL, 5, NULL, 1 /* core 1 */);
     } else {
         ESP_LOGW(TAG, "IMU 미검출 → 읽기 태스크 생략(환경만 준비됨)");
+    }
+
+    /* 통신방식이 CAN이면 TWAI 전송계층 기동(하트비트 발행 + CAN 명령 수신). */
+    if (rcube_config_cmf() == 1) {
+        esp_err_t can_err = can_transport_init(rcube_config_node_id(), rcube_config_term_id());
+        if (can_err == ESP_OK) {
+            ESP_LOGI(TAG, "CMF=CAN → CAN transport 활성(BLE는 설정/복구용으로만)");
+        } else {
+            ESP_LOGE(TAG, "CAN transport 초기화 실패: %s", esp_err_to_name(can_err));
+        }
     }
 
     /* 모션 태스크를 Core 1에 명시 핀닝 (로드맵 12.2). */

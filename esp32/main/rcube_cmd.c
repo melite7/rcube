@@ -267,3 +267,9 @@ void rcube_cmd_init(const rcube_cmd_ops_t *ops)
     }
     ESP_LOGI(TAG, "command layer ready (E0/A0 + 멤버 중계, 그 외 CmdAck NAK)");
 }
+
+void rcube_cmd_override_send(rcube_send_fn send)
+{
+    s_ops.send = send;
+    ESP_LOGI(TAG, "응답 콜백 교체(CAN 회신 경로)");
+}

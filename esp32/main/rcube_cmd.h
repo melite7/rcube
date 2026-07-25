@@ -47,6 +47,9 @@ typedef struct {
 /* 명령 레이어 초기화. ops 는 호출 이후에도 유효한 저장소를 가리켜야 한다. */
 void rcube_cmd_init(const rcube_cmd_ops_t *ops);
 
+/* 응답(회신) 콜백만 교체한다. CAN 큐브가 회신을 CAN으로 보내도록 할 때 사용. */
+void rcube_cmd_override_send(rcube_send_fn send);
+
 /* 수신한 원시 프레임 1개를 파싱·디스패치한다. (BLE write 콜백에서 호출) */
 void rcube_cmd_on_frame(const uint8_t *data, uint16_t len);
 
