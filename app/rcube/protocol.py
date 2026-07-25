@@ -145,6 +145,8 @@ def build_set_led_solid(target_id: int, rgb, n: int = 3) -> bytes:
 D3_SUB_SET_GROUP = 0x01   # payload=[0x01, group_id] : 그룹 저장 후 재부팅
 D3_SUB_FIX_ORDER = 0x02   # payload=[0x02]           : 순서고정(각 큐브가 순서를 노드ID로) + 재부팅
 D3_SUB_SET_NODE = 0x03    # payload=[0x03, node_id]  : 노드ID 저장 후 재부팅
+D3_SUB_SET_NETCONF = 0x04 # payload=[0x04, node_id, cmf, term_id] : 통신방식 세팅 저장(재부팅 X)
+D3_SUB_REBOOT = 0x05      # payload=[0x05]           : 재부팅(브로드캐스트=전체)
 
 
 def build_set_group(group_id: int, *, target_id: int = ADDR_BROADCAST) -> bytes:
@@ -157,6 +159,30 @@ def build_set_group(group_id: int, *, target_id: int = ADDR_BROADCAST) -> bytes:
         raise ValueError(f"group_id 범위(0~99) 초과: {group_id}")
     payload = bytes((D3_SUB_SET_GROUP, group_id & 0xFF))
     return build_frame(target_id, OpCode.SetNodeConfig, payload)
+
+
+# ---- 통신방식(CMF) ----
+CMF_BLE = 0x00
+CMF_CAN = 0x01
+
+
+def build_set_netconf(node_id: int, cmf: int, term_id: int = 0,
+                      *, target_id: int = ADDR_HUB) -> bytes:
+    """SetNodeConfig/SET_NETCONF. 통신방식 세팅 저장(기획서 7.2). 재부팅은 별도.
+
+    payload = [SET_NETCONF, node_id, cmf(0=BLE/1=CAN), term_id]
+    - node_id : 이 큐브의 노드ID(현재 연결 순서값). 저장 순간 고정형이 된다.
+    - cmf     : 다음 부팅부터 사용할 통신방식.
+    - term_id : (CAN 큐브만 의미) 종단노드ID = 유닛의 CAN 큐브 중 최대 노드ID.
+    target_id : 아그리게이터=0xFE, 멤버=가상ID(아그리게이터가 중계).
+    """
+    return build_frame(target_id, OpCode.SetNodeConfig,
+                       bytes((D3_SUB_SET_NETCONF, node_id & 0xFF, cmf & 0xFF, term_id & 0xFF)))
+
+
+def build_reboot_all(*, target_id: int = ADDR_BROADCAST) -> bytes:
+    """SetNodeConfig/REBOOT. 기본 브로드캐스트: 연결된 큐브+멤버 전체 재부팅(기획서 7.2 step4)."""
+    return build_frame(target_id, OpCode.SetNodeConfig, bytes((D3_SUB_REBOOT,)))
 
 
 def build_fix_order(*, target_id: int = ADDR_HUB) -> bytes:

@@ -30,6 +30,8 @@ from rcube import (
     build_set_aggregator,
     build_set_group,
     build_fix_order,
+    build_set_netconf,
+    build_reboot_all,
     parse_frame,
     ADDR_HUB,
     ADDR_BROADCAST,
@@ -72,6 +74,10 @@ def _parse_nn(name: str):
         return None
 
 
+# 큐브 가상ID(연결순서) → 노드ID 색 이름 (기획서 RGBCMYVO)
+CUBE_COLORS = {1: "Red", 2: "Green", 3: "Blue", 4: "Cyan"}
+
+
 BTN_IDLE = {"bg": "#b8b8b8", "fg": "#000000", "activebackground": "#a8a8a8"}
 BTN_BUSY = {"bg": "#e69500", "fg": "#ffffff", "activebackground": "#cf8600"}
 BTN_DONE = {"bg": "#111111", "fg": "#ffffff", "activebackground": "#333333"}
@@ -100,6 +106,8 @@ class RCubeApp:
         self.scn_done = False     # 완료(검정) 여부
         self.scn_ordered = False  # 이번 시나리오가 순서고정 연결인지(시작 시 캡처)
         self.r_btns: dict[int, tk.Button] = {}
+        self.net_combos: dict[int, ttk.Combobox] = {}  # 큐브 vid → 통신방식 콤보
+        self._net_ui_n = 0        # 현재 네트워크 UI에 표시된 큐브 수
 
         root.title("R-Cube BLE 제어")
         root.geometry("660x620")
@@ -152,7 +160,19 @@ class RCubeApp:
             row=0, column=3, sticky="w", padx=6)
         grpf.columnconfigure(3, weight=1)
 
-        # 3) 로그
+        # 3) 네트워크(통신방식) 설정 — 다음 부팅부터 적용
+        netf = ttk.LabelFrame(self.root, text="네트워크 설정 (큐브별 BLE/CAN · 다음 부팅부터 적용)")
+        netf.pack(fill="x", **pad)
+        self.net_rows = ttk.Frame(netf)
+        self.net_rows.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+        self.net_hint = ttk.Label(self.net_rows,
+                                  text="R1~R4로 큐브를 모두 연결하면 여기에 큐브별 통신방식 선택이 나타납니다.")
+        self.net_hint.grid(row=0, column=0, sticky="w")
+        self.net_save_btn = tk.Button(netf, text="저장(재부팅)", command=self.on_save_netconf,
+                                      state="disabled")
+        self.net_save_btn.pack(side="right", padx=8, pady=4)
+
+        # 4) 로그
         logf = ttk.LabelFrame(self.root, text="로그")
         logf.pack(fill="both", expand=True, **pad)
         self.log = tk.Text(logf, height=14, wrap="none", state="disabled",
@@ -166,7 +186,7 @@ class RCubeApp:
         self.log.tag_config("scn", foreground="#fd6")
         self.log.tag_config("err", foreground="#f66")
 
-        # 4) 디버그(수동 제어)
+        # 5) 디버그(수동 제어)
         dbg = ttk.LabelFrame(self.root, text="디버그 — 수동 스캔·전송")
         dbg.pack(fill="x", **pad)
 
@@ -220,6 +240,32 @@ class RCubeApp:
         # 순서고정하기: R2~R4가 모두 연결(완료)됐을 때만 활성.
         fix_on = (self.active is not None and self.active >= 2 and self.scn_done)
         self.fix_btn.configure(state="normal" if fix_on else "disabled")
+        # 네트워크 설정 UI: 시나리오 완료 시 큐브 수만큼 행 표시.
+        self._set_net_ui(self.scn_total if (self.active is not None and self.scn_done) else 0)
+
+    def _set_net_ui(self, n: int) -> None:
+        """네트워크 설정 UI를 큐브 n개로 구성(0이면 안내문만). 안정 상태면 재구성 안 함."""
+        if n == self._net_ui_n:
+            return
+        self._net_ui_n = n
+        for w in self.net_rows.winfo_children():
+            w.destroy()
+        self.net_combos.clear()
+        if n == 0:
+            self.net_hint = ttk.Label(self.net_rows,
+                text="R1~R4로 큐브를 모두 연결하면 여기에 큐브별 통신방식 선택이 나타납니다.")
+            self.net_hint.grid(row=0, column=0, sticky="w")
+            self.net_save_btn.configure(state="disabled")
+            return
+        for vid in range(1, n + 1):
+            color = CUBE_COLORS.get(vid, f"vid{vid}")
+            ttk.Label(self.net_rows, text=f"큐브 {vid} ({color})").grid(
+                row=vid - 1, column=0, sticky="w", padx=(0, 8), pady=2)
+            cb = ttk.Combobox(self.net_rows, state="readonly", width=6, values=["BLE", "CAN"])
+            cb.set("BLE")   # 공장 기본
+            cb.grid(row=vid - 1, column=1, sticky="w", pady=2)
+            self.net_combos[vid] = cb
+        self.net_save_btn.configure(state="normal")
 
     # =====================================================================
     # 코루틴 실행 헬퍼
@@ -441,6 +487,37 @@ class RCubeApp:
             return
         self._log("[순서고정] FIX_ORDER 전송 → 각 큐브가 현재 순서를 노드ID로 저장 후 재부팅(연결 끊김)", "scn")
         self._run(self.ble.send(build_fix_order()))
+
+    def on_save_netconf(self) -> None:
+        """큐브별 통신방식(BLE/CAN)을 저장시키고 전체 재부팅(기획서 7.2). 다음 부팅부터 적용."""
+        if self.active is None or not self.scn_done:
+            self._log("[네트워크] 모든 큐브가 연결 완료된 뒤 저장하세요.", "err")
+            return
+        if not self.ble.is_connected:
+            self._log("[네트워크] 연결이 없습니다.", "err")
+            return
+        n = self.scn_total
+        choices: dict[int, int] = {}
+        can_vids = []
+        for vid in range(1, n + 1):
+            cb = self.net_combos.get(vid)
+            cmf = 1 if (cb is not None and cb.get() == "CAN") else 0
+            choices[vid] = cmf
+            if cmf == 1:
+                can_vids.append(vid)
+        term = max(can_vids) if can_vids else 0
+        desc = ", ".join(f"{vid}:{'CAN' if choices[vid] else 'BLE'}" for vid in range(1, n + 1))
+        self._log(f"[네트워크] 저장 [{desc}] 종단노드={term} → 각 큐브 저장 후 전체 재부팅(연결 끊김)", "scn")
+        self._run(self._save_netconf_coro(n, choices, term))
+
+    async def _save_netconf_coro(self, n: int, choices: dict, term: int) -> None:
+        # 1) 각 큐브에 통신방식 세팅 저장(재부팅 없이). vid1=아그리게이터(0xFE), 그 외=멤버 중계.
+        for vid in range(1, n + 1):
+            target = ADDR_HUB if vid == 1 else vid
+            await self.ble.send(build_set_netconf(vid, choices[vid], term, target_id=target))
+        await asyncio.sleep(0.2)
+        # 2) 전체 재부팅(브로드캐스트).
+        await self.ble.send(build_reboot_all())
 
     def on_send(self) -> None:
         sel = self.op_cb.get()
