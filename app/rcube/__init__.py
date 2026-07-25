@@ -33,6 +33,7 @@ from .protocol import (
     OP_AGGREGATOR_EVENT,
 )
 from .ble import RCubeBLE, ScanResult, RCUBE_NAME_PREFIX
+from .can import RCubeCAN, KNOWN_INTERFACES, DEFAULT_BITRATE
 
 __all__ = [
     "OpCode",
@@ -63,4 +64,7 @@ __all__ = [
     "RCubeBLE",
     "ScanResult",
     "RCUBE_NAME_PREFIX",
+    "RCubeCAN",
+    "KNOWN_INTERFACES",
+    "DEFAULT_BITRATE",
 ]

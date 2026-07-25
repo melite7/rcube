@@ -25,6 +25,9 @@ from tkinter import ttk
 from rcube import (
     OpCode,
     RCubeBLE,
+    RCubeCAN,
+    KNOWN_INTERFACES,
+    DEFAULT_BITRATE,
     build_frame,
     build_set_led_solid,
     build_set_aggregator,
@@ -97,6 +100,11 @@ class RCubeApp:
             on_log=lambda msg: self.ui_q.put(("log", msg)),
             on_state=lambda ok: self.ui_q.put(("state", ok)),
         )
+        self.can = RCubeCAN(
+            on_notify=lambda raw: self.ui_q.put(("notify", raw)),
+            on_log=lambda msg: self.ui_q.put(("log", msg)),
+            on_state=lambda ok: self.ui_q.put(("can_state", ok)),
+        )
         self._scan_results = []
 
         # ---- 시나리오 상태(UI 스레드 전용) ----
@@ -109,9 +117,9 @@ class RCubeApp:
         self.net_combos: dict[int, ttk.Combobox] = {}  # 큐브 vid → 통신방식 콤보
         self._net_ui_n = 0        # 현재 네트워크 UI에 표시된 큐브 수
 
-        root.title("R-Cube BLE 제어")
-        root.geometry("660x620")
-        root.minsize(560, 520)
+        root.title("R-Cube 제어 (BLE / CAN)")
+        root.geometry("680x780")
+        root.minsize(580, 660)
 
         self._build_ui()
         self.root.after(self.POLL_MS, self._pump_ui)
@@ -186,7 +194,27 @@ class RCubeApp:
         self.log.tag_config("scn", foreground="#fd6")
         self.log.tag_config("err", foreground="#f66")
 
-        # 5) 디버그(수동 제어)
+        # 5) CAN (USB-CAN 어댑터)
+        canf = ttk.LabelFrame(self.root, text="CAN (USB-CAN 어댑터) — CMF=CAN 큐브 제어")
+        canf.pack(fill="x", **pad)
+        ttk.Label(canf, text="interface").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.can_if = ttk.Combobox(canf, state="readonly", width=10, values=KNOWN_INTERFACES)
+        self.can_if.set("slcan")
+        self.can_if.grid(row=0, column=1, sticky="w")
+        ttk.Label(canf, text="channel").grid(row=0, column=2, sticky="e", padx=4)
+        self.can_ch = tk.StringVar(value="COM4")
+        ttk.Entry(canf, textvariable=self.can_ch, width=12).grid(row=0, column=3, sticky="w")
+        ttk.Label(canf, text="bitrate").grid(row=0, column=4, sticky="e", padx=4)
+        self.can_br = tk.StringVar(value=str(DEFAULT_BITRATE))
+        ttk.Entry(canf, textvariable=self.can_br, width=8).grid(row=0, column=5, sticky="w")
+        ttk.Button(canf, text="열기", command=self.on_can_open).grid(row=0, column=6, padx=3)
+        ttk.Button(canf, text="닫기", command=self.on_can_close).grid(row=0, column=7, padx=3)
+        ttk.Button(canf, text="노드검색", command=self.on_can_discover).grid(row=0, column=8, padx=3)
+        self.can_status_var = tk.StringVar(value="● CAN 닫힘")
+        ttk.Label(canf, textvariable=self.can_status_var).grid(
+            row=1, column=0, columnspan=9, sticky="w", padx=6, pady=(0, 4))
+
+        # 6) 디버그(수동 제어)
         dbg = ttk.LabelFrame(self.root, text="디버그 — 수동 스캔·전송")
         dbg.pack(fill="x", **pad)
 
@@ -203,7 +231,8 @@ class RCubeApp:
         self.op_cb = ttk.Combobox(dbg, state="readonly", width=26, values=self._op_names)
         self.op_cb.grid(row=1, column=2, columnspan=2, sticky="we", padx=4, pady=4)
         self.op_cb.set(f"Heartbeat (0x{OpCode.Heartbeat.value:02X})")
-        ttk.Button(dbg, text="전송", command=self.on_send).grid(row=1, column=4, padx=4, pady=4)
+        ttk.Button(dbg, text="BLE전송", command=self.on_send).grid(row=1, column=4, padx=4, pady=4)
+        ttk.Button(dbg, text="CAN전송", command=self.on_can_send).grid(row=1, column=5, padx=4, pady=4)
 
         ttk.Label(dbg, text="payload(hex)").grid(row=2, column=0, sticky="e", padx=4)
         self.payload_var = tk.StringVar(value="")
@@ -404,6 +433,8 @@ class RCubeApp:
                     self._log(f"[오류] {payload}", "err")
                 elif kind == "scan":
                     self._apply_scan(payload)
+                elif kind == "can_state":
+                    self.can_status_var.set("● CAN 열림" if payload else "● CAN 닫힘")
         except queue.Empty:
             pass
         self.root.after(self.POLL_MS, self._pump_ui)
@@ -519,13 +550,14 @@ class RCubeApp:
         # 2) 전체 재부팅(브로드캐스트).
         await self.ble.send(build_reboot_all())
 
-    def on_send(self) -> None:
+    def _debug_frame(self):
+        """디버그 입력(Target/OpCode/payload)에서 표준 프레임을 만든다. 실패 시 None."""
         sel = self.op_cb.get()
         try:
             op = int(sel.rsplit("0x", 1)[1].rstrip(")"), 16)
         except (IndexError, ValueError):
             self._log("[오류] OpCode를 선택하세요.", "err")
-            return
+            return None
         txt = self.target_var.get().strip().lower().replace("0x", "")
         target = int(txt, 16) if txt else ADDR_BROADCAST
         hexstr = self.payload_var.get().strip().replace(" ", "")
@@ -533,13 +565,62 @@ class RCubeApp:
             payload = bytes.fromhex(hexstr) if hexstr else b""
         except ValueError:
             self._log("[오류] payload는 hex(예: E0 01 FF)여야 합니다.", "err")
-            return
+            return None
         try:
-            frame = build_frame(target, op, payload)
+            return build_frame(target, op, payload)
         except Exception as e:
             self._log(f"[프레임 오류] {e}", "err")
+            return None
+
+    def on_send(self) -> None:
+        frame = self._debug_frame()
+        if frame is not None:
+            self._run(self.ble.send(frame))
+
+    # ---- CAN(USB-CAN) 핸들러 ----
+    def on_can_open(self) -> None:
+        interface = self.can_if.get()
+        channel = self.can_ch.get().strip()
+        try:
+            bitrate = int(self.can_br.get().strip())
+        except ValueError:
+            self._log("[CAN] bitrate는 정수여야 합니다.", "err")
             return
-        self._run(self.ble.send(frame))
+        self._log(f"[CAN] 버스 여는 중… ({interface}/{channel})")
+
+        def work():
+            try:
+                self.can.open(interface, channel, bitrate)
+            except Exception as e:
+                self.ui_q.put(("error", f"CAN 열기 실패: {e!r}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_can_close(self) -> None:
+        threading.Thread(target=self.can.close, daemon=True).start()
+
+    def on_can_discover(self) -> None:
+        if not self.can.is_connected:
+            self._log("[CAN] 먼저 버스를 여세요.", "err")
+            return
+        self._log("[CAN] 노드 검색(2초, 하트비트 수집)…")
+
+        def work():
+            nodes = self.can.discover(2.0)
+            names = ", ".join(f"0x{n:02X}" for n in nodes) if nodes else "없음"
+            self.ui_q.put(("log", f"[CAN] 발견 노드ID: {names}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_can_send(self) -> None:
+        if not self.can.is_connected:
+            self._log("[CAN] 먼저 버스를 여세요.", "err")
+            return
+        frame = self._debug_frame()
+        if frame is None:
+            return
+        try:
+            self.can.send(frame)
+        except Exception as e:
+            self._log(f"[CAN 전송 오류] {e}", "err")
 
     # =====================================================================
     # 종료
@@ -548,6 +629,10 @@ class RCubeApp:
         try:
             fut = self.loop.submit(self.ble.disconnect())
             fut.result(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self.can.close()
         except Exception:
             pass
         self.loop.stop()
