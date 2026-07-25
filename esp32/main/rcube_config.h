@@ -19,6 +19,8 @@
 /* 공장 디폴트값 (일단 이 값으로 저장; 추후 조정 가능). */
 #define RCUBE_DEFAULT_GROUP_ID  0x00u   /* 0 = 미지정(그룹 없음) */
 #define RCUBE_DEFAULT_NODE_ID   0x00u   /* 0 = 미할당(공장 출하값). 순서고정 시 1~8 저장 */
+#define RCUBE_DEFAULT_CMF       0x00u   /* 통신방식: 0=BLE(공장기본), 1=CAN */
+#define RCUBE_DEFAULT_TERM_ID   0x00u   /* CAN 종단노드ID(=CAN 큐브 중 최대 노드ID). 0=없음 */
 
 /* NVS에서 설정을 로드한다. 값이 없으면 공장 디폴트로 채워 저장한다.
  * app_main 초기화(nvs_flash_init 이후)에서 1회 호출. */
@@ -27,10 +29,14 @@ esp_err_t rcube_config_init(void);
 /* 캐시된 현재 값 조회. */
 uint8_t rcube_config_group_id(void);
 uint8_t rcube_config_node_id(void);
+uint8_t rcube_config_cmf(void);       /* 0=BLE, 1=CAN */
+uint8_t rcube_config_term_id(void);   /* CAN 종단노드ID */
 
 /* 값 변경 + NVS 영구 저장. 성공 시 ESP_OK. */
 esp_err_t rcube_config_set_group_id(uint8_t group_id);
 esp_err_t rcube_config_set_node_id(uint8_t node_id);
+esp_err_t rcube_config_set_cmf(uint8_t cmf);
+esp_err_t rcube_config_set_term_id(uint8_t term_id);
 
 /* 공장 디폴트로 되돌려 저장(ResetConfig 대응). */
 esp_err_t rcube_config_reset_factory(void);

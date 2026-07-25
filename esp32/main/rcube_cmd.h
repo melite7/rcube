@@ -39,6 +39,10 @@ typedef struct {
 #define RCUBE_D3_SUB_SET_GROUP  0x01u
 #define RCUBE_D3_SUB_FIX_ORDER  0x02u
 #define RCUBE_D3_SUB_SET_NODE   0x03u
+/* SET_NETCONF: payload=[0x04, node_id, cmf(0=BLE/1=CAN), term_node_id]. 저장만(재부팅 X). */
+#define RCUBE_D3_SUB_SET_NETCONF 0x04u
+/* REBOOT: payload=[0x05]. 재부팅. 브로드캐스트면 아그리게이터가 전 멤버로 중계 후 자기도. */
+#define RCUBE_D3_SUB_REBOOT      0x05u
 
 /* 명령 레이어 초기화. ops 는 호출 이후에도 유효한 저장소를 가리켜야 한다. */
 void rcube_cmd_init(const rcube_cmd_ops_t *ops);

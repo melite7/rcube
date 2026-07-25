@@ -164,6 +164,23 @@ static uint8_t handle_set_node_config(uint8_t target, const uint8_t *p, uint16_t
         schedule_reboot();
         return RCUBE_RC_OK;
     }
+    case RCUBE_D3_SUB_SET_NETCONF: {
+        /* payload=[0x04, node_id, cmf, term_id]. 통신방식 세팅 저장(재부팅은 별도 REBOOT). */
+        if (plen < 4) return RCUBE_RC_BAD_LENGTH;
+        uint8_t node_id = p[1], cmf = p[2], term_id = p[3];
+        esp_err_t e = rcube_config_set_node_id(node_id);
+        if (e == ESP_OK) e = rcube_config_set_cmf(cmf);
+        if (e == ESP_OK) e = rcube_config_set_term_id(term_id);
+        if (e != ESP_OK) return RCUBE_RC_FLASH_FAIL;
+        ESP_LOGI(TAG, "D3 SET_NETCONF: node=0x%02x cmf=%u(%s) term=0x%02x 저장(재부팅 대기)",
+                 node_id, cmf, cmf ? "CAN" : "BLE", term_id);
+        return RCUBE_RC_OK;
+    }
+    case RCUBE_D3_SUB_REBOOT: {
+        ESP_LOGI(TAG, "D3 REBOOT: 재부팅 예약");
+        schedule_reboot();
+        return RCUBE_RC_OK;
+    }
     case RCUBE_D3_SUB_FIX_ORDER: {
         /* 이 큐브(아그리게이터/첫 큐브)는 노드1로 저장. 멤버들은 아그리게이터가
          * 각자 가상ID를 노드ID로 저장시킨다(ops.fix_order). 전체 재부팅. */

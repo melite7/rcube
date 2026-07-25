@@ -132,10 +132,17 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* 영구 설정 로드(그룹번호/노드번호). 없으면 공장 디폴트로 채워 저장. */
+    /* 영구 설정 로드(그룹번호/노드번호/통신방식). 없으면 공장 디폴트로 채워 저장. */
     rcube_config_init();
-    ESP_LOGI(TAG, "identity: group=0x%02x, node=0x%02x",
-             rcube_config_group_id(), rcube_config_node_id());
+    ESP_LOGI(TAG, "identity: group=0x%02x, node=0x%02x, cmf=%u(%s), term=0x%02x",
+             rcube_config_group_id(), rcube_config_node_id(),
+             rcube_config_cmf(), rcube_config_cmf() ? "CAN" : "BLE",
+             rcube_config_term_id());
+    if (rcube_config_cmf() == 1) {
+        /* CMF=CAN: 기획서상 CAN 부팅/하트비트로 동작해야 하나 TWAI 미구현.
+         * 개발 중 벽돌화 방지를 위해 임시로 BLE 경로를 유지한다(후속: CAN 스택). */
+        ESP_LOGW(TAG, "CMF=CAN 선택됨 — TWAI 미구현 → 임시 BLE 폴백(추후 CAN 구현 필요)");
+    }
 
     /* LED / 부저 준비. 부팅 후 LED는 그룹번호 아이덴티티 표시가 담당한다. */
     board_led_init();
