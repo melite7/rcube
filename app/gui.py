@@ -29,6 +29,7 @@ from rcube import (
     KNOWN_INTERFACES,
     DEFAULT_BITRATE,
     build_frame,
+    build_set_led,
     build_set_led_solid,
     build_set_aggregator,
     build_set_group,
@@ -79,6 +80,12 @@ def _parse_nn(name: str):
 
 # 큐브 가상ID(연결순서) → 노드ID 색 이름 (기획서 RGBCMYVO)
 CUBE_COLORS = {1: "Red", 2: "Green", 3: "Blue", 4: "Cyan"}
+
+# 노드ID(1~8) → RGB (기획서 RGBCMYVO). CAN 색 확인 명령용.
+NODE_RGB = {
+    1: (255, 0, 0), 2: (0, 255, 0), 3: (0, 0, 255), 4: (0, 255, 255),
+    5: (255, 0, 255), 6: (255, 255, 0), 7: (148, 0, 211), 8: (255, 90, 0),
+}
 
 
 BTN_IDLE = {"bg": "#b8b8b8", "fg": "#000000", "activebackground": "#a8a8a8"}
@@ -210,6 +217,7 @@ class RCubeApp:
         ttk.Button(canf, text="열기", command=self.on_can_open).grid(row=0, column=6, padx=3)
         ttk.Button(canf, text="닫기", command=self.on_can_close).grid(row=0, column=7, padx=3)
         ttk.Button(canf, text="노드검색", command=self.on_can_discover).grid(row=0, column=8, padx=3)
+        ttk.Button(canf, text="순서연결", command=self.on_can_connect_ordered).grid(row=0, column=9, padx=3)
         self.can_status_var = tk.StringVar(value="● CAN 닫힘")
         ttk.Label(canf, textvariable=self.can_status_var).grid(
             row=1, column=0, columnspan=9, sticky="w", padx=6, pady=(0, 4))
@@ -608,6 +616,32 @@ class RCubeApp:
             nodes = self.can.discover(2.0)
             names = ", ".join(f"0x{n:02X}" for n in nodes) if nodes else "없음"
             self.ui_q.put(("log", f"[CAN] 발견 노드ID: {names}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_can_connect_ordered(self) -> None:
+        """고정형 CAN 연결(기획서 7.2 CAN 분기): 하트비트로 노드 발견 → 노드ID 순서대로 연결."""
+        if not self.can.is_connected:
+            self._log("[CAN] 먼저 버스를 여세요.", "err")
+            return
+        self._log("[CAN] 고정형 순서연결: 하트비트 수집 후 노드ID 오름차순 연결(3초)…", "scn")
+
+        def per_node(nid, index):
+            # 고정형 CAN 큐브는 자기 노드ID 색으로 자가점등. PC는 순서대로 색 확인만 보낸다.
+            rgb = NODE_RGB.get(nid, (255, 255, 255))
+            try:
+                # CAN 데이터필드 ≤8B → LED 1개짜리 확인 색(payload 4B)만 전송.
+                self.can.send(build_set_led(nid, [rgb]))
+            except Exception as e:
+                self.ui_q.put(("log", f"[CAN] 노드 0x{nid:02X} 색확인 전송 실패: {e}"))
+            self.ui_q.put(("log", f"[CAN] 노드 0x{nid:02X} 연결(순서 {index + 1})"))
+
+        def work():
+            nodes = self.can.connect_ordered(3.0, per_node=per_node)
+            if not nodes:
+                self.ui_q.put(("log", "[CAN] 노드 없음(하트비트 미수신). 큐브 CMF=CAN·버스 배선·종단 확인.", ))
+            else:
+                order = ", ".join(f"0x{n:02X}" for n in nodes)
+                self.ui_q.put(("log", f"[CAN] 순서연결 완료 — 노드ID 순: {order}"))
         threading.Thread(target=work, daemon=True).start()
 
     def on_can_send(self) -> None:

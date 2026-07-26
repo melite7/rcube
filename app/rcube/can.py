@@ -156,6 +156,23 @@ class RCubeCAN:
         with self._lock:
             return sorted(self._nodes)
 
+    # ---- 고정형 순서 연결 (기획서 7.2 [CAN 분기]) ----
+    def connect_ordered(self, timeout: float = 3.0, per_node=None) -> list[int]:
+        """CAN 버스의 고정형 큐브를 노드ID 오름차순으로 '연결'한다.
+
+        CAN은 BLE 같은 연결 핸드셰이크가 없다. 각 CAN 큐브는 부팅 시 자기 노드ID
+        색으로 자가점등하며 하트비트를 발행하므로, PC는 (1) 하트비트로 존재 노드를
+        발견하고 (2) 노드ID 오름차순으로 순회하며 확인한다(기획서 7.2).
+
+        per_node(node_id, index)를 노드ID 순서대로 호출(색 확인 명령 전송 등).
+        발견·정렬된 노드ID 목록(오름차순)을 반환한다.
+        """
+        nodes = self.discover(timeout)   # discover()는 오름차순 정렬 반환
+        for i, nid in enumerate(nodes):
+            if per_node is not None:
+                per_node(nid, i)
+        return nodes
+
     # ---- 수신 루프 ----
     def _rx_loop(self) -> None:
         while not self._stop.is_set():
