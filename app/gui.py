@@ -17,10 +17,15 @@ BLE I/O(connect/send/disconnect)만 코루틴으로 백그라운드 루프에 �
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
+
+# 네트워크 세팅 매핑(nodeID→CMF) 저장 파일 (기획서 7.2 PC 매핑 테이블).
+NETMAP_PATH = Path(__file__).resolve().parent / "netmap.json"
 
 from rcube import (
     OpCode,
@@ -123,6 +128,8 @@ class RCubeApp:
         self.r_btns: dict[int, tk.Button] = {}
         self.net_combos: dict[int, ttk.Combobox] = {}  # 큐브 vid → 통신방식 콤보
         self._net_ui_n = 0        # 현재 네트워크 UI에 표시된 큐브 수
+        self._mixed_active = False  # 고정형 혼합연결 진행 중(0xA1 멤버수 추적용)
+        self._mixed_members = 0     # 혼합연결 중 연결된 BLE 멤버 수
 
         root.title("R-Cube 제어 (BLE / CAN)")
         root.geometry("680x780")
@@ -186,6 +193,14 @@ class RCubeApp:
         self.net_save_btn = tk.Button(netf, text="저장(재부팅)", command=self.on_save_netconf,
                                       state="disabled")
         self.net_save_btn.pack(side="right", padx=8, pady=4)
+
+        # 3b) 고정형 혼합 연결 (BLE+CAN, 네트워크 저장 후 재부팅한 유닛 재연결)
+        mixf = ttk.LabelFrame(self.root, text="고정형 연결 (혼합 BLE+CAN · 네트워크 저장/재부팅 후)")
+        mixf.pack(fill="x", **pad)
+        ttk.Button(mixf, text="고정형 연결", command=self.on_fixed_connect).pack(side="left", padx=8, pady=4)
+        self.mix_status_var = tk.StringVar(
+            value="네트워크 설정 저장 시 만들어진 매핑으로 BLE·CAN 큐브를 노드ID 순으로 연결합니다.")
+        ttk.Label(mixf, textvariable=self.mix_status_var).pack(side="left", padx=6)
 
         # 4) 로그
         logf = ttk.LabelFrame(self.root, text="로그")
@@ -454,7 +469,11 @@ class RCubeApp:
             return
         self._log(f"    └ {fr}", "rx")
         if fr.op_code == OP_AGGREGATOR_EVENT:
-            self._on_aggregator_event(fr)
+            if self.active is not None:
+                self._on_aggregator_event(fr)
+            elif self._mixed_active:
+                # 혼합 고정형 연결 중: 허브가 보고한 연결 멤버 수 추적.
+                self._mixed_members = fr.payload[0] if fr.payload else self._mixed_members
 
     def _handle_state(self, ok: bool) -> None:
         self._set_status("● 연결됨" if ok else "● 대기")
@@ -546,8 +565,103 @@ class RCubeApp:
                 can_vids.append(vid)
         term = max(can_vids) if can_vids else 0
         desc = ", ".join(f"{vid}:{'CAN' if choices[vid] else 'BLE'}" for vid in range(1, n + 1))
+        # 기획서 7.2 step3: PC가 nodeID→CMF 매핑 테이블을 자기 메모리에 저장(고정형 재연결 근거).
+        self._save_netmap(n, choices, term)
         self._log(f"[네트워크] 저장 [{desc}] 종단노드={term} → 각 큐브 저장 후 전체 재부팅(연결 끊김)", "scn")
         self._run(self._save_netconf_coro(n, choices, term))
+
+    def _save_netmap(self, n: int, choices: dict, term: int) -> None:
+        try:
+            NETMAP_PATH.write_text(json.dumps(
+                {"n": n, "term": term, "cmf": {str(v): c for v, c in choices.items()}},
+                ensure_ascii=False, indent=2), encoding="utf-8")
+            self._log(f"[네트워크] 매핑 저장: {NETMAP_PATH.name}")
+        except Exception as e:
+            self._log(f"[네트워크] 매핑 저장 실패: {e}", "err")
+
+    def _load_netmap(self):
+        try:
+            if not NETMAP_PATH.exists():
+                return None
+            return json.loads(NETMAP_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            self._log(f"[고정형] 매핑 읽기 실패: {e}", "err")
+            return None
+
+    # ---- 고정형 혼합 연결 (기획서 7.2 재연결) ----
+    def on_fixed_connect(self) -> None:
+        """저장된 매핑(nodeID→CMF)으로 BLE·CAN 큐브를 노드ID 순으로 재연결."""
+        m = self._load_netmap()
+        if not m:
+            self._log("[고정형] 저장된 매핑이 없습니다. 먼저 '네트워크 설정 저장'을 하세요.", "err")
+            return
+        if self.active is not None:
+            self._log("[고정형] 진행 중인 R1~R4 시나리오를 먼저 해제하세요.", "err")
+            return
+        cmf = m.get("cmf", {})
+        ble = sorted(int(k) for k, v in cmf.items() if int(v) == 0)
+        can = sorted(int(k) for k, v in cmf.items() if int(v) == 1)
+        self._log(f"[고정형] 매핑 N={m.get('n')} · BLE={ble} · CAN={can}", "scn")
+
+        # CAN 분기: 버스가 열려 있으면 노드ID 순으로 연결.
+        if can:
+            if self.can.is_connected:
+                self._run_can_fixed(can)
+            else:
+                self._log("[고정형/CAN] CAN 큐브가 있으나 버스 미열림 — CAN 프레임에서 '열기' 후 다시 시도.", "err")
+
+        # BLE 분기: 허브(최소 BLE 노드ID) 연결 후 나머지 BLE 멤버를 노드ID 순으로.
+        if ble:
+            self._run(self._fixed_ble_coro(ble))
+
+    def _run_can_fixed(self, can_nodes: list) -> None:
+        def per(nid, index):
+            rgb = NODE_RGB.get(nid, (255, 255, 255))
+            try:
+                self.can.send(build_set_led(nid, [rgb]))
+            except Exception:
+                pass
+            self.ui_q.put(("log", f"[고정형/CAN] 노드 0x{nid:02X} 연결(순서 {index + 1})"))
+
+        def work():
+            found = self.can.connect_ordered(3.0, per_node=per)
+            missing = [n for n in can_nodes if n not in found]
+            msg = f"[고정형/CAN] 발견 {[hex(n) for n in found]}"
+            if missing:
+                msg += f" · 미발견 {[hex(n) for n in missing]}(전원/버스 확인)"
+            self.ui_q.put(("log", msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    async def _fixed_ble_coro(self, ble: list) -> None:
+        hub = ble[0]          # 최소 BLE 노드ID = BLE 허브 큐브
+        count = len(ble)
+        self.ui_q.put(("log", f"[고정형/BLE] 허브=노드{hub}, BLE {count}대 연결 시작"))
+        # 허브(광고이름 NN==hub) 큐브를 찾아 연결.
+        results = await RCubeBLE.scan(timeout=5.0)
+        addr = next((r.address for r in results if _parse_nn(r.name) == hub), None)
+        if addr is None:
+            raise RuntimeError(f"BLE 허브(RCUBEROBOT.GG.{hub:02d})를 찾지 못했습니다.")
+        await self.ble.connect(addr)
+        # 허브는 자기 노드ID 색으로.
+        await self.ble.send(build_set_led_solid(ADDR_HUB, NODE_RGB.get(hub, (255, 255, 255))))
+        if count == 1:
+            self.ui_q.put(("log", "[고정형/BLE] 단일 BLE 큐브 연결 완료"))
+            return
+        # 허브를 아그리게이터로 승격(고정형=NN 기준). 멤버 = 나머지 BLE 큐브.
+        self._mixed_active = True
+        self._mixed_members = 0
+        await self.ble.send(build_set_aggregator(count, ordered=True))
+        self.ui_q.put(("log", f"[고정형/BLE] 허브가 BLE 멤버 {count - 1}대 연결 대기…"))
+        for _ in range(40):   # 최대 20초 대기
+            if self._mixed_members >= count - 1:
+                break
+            await asyncio.sleep(0.5)
+        # 각 BLE 멤버에 자기 노드ID 색 전송(허브가 target=노드ID로 중계, 고정형 vid=노드ID).
+        for nid in ble[1:]:
+            await self.ble.send(build_set_led_solid(nid, NODE_RGB.get(nid, (255, 255, 255))))
+        self._mixed_active = False
+        done = min(self._mixed_members + 1, count)
+        self.ui_q.put(("log", f"[고정형/BLE] 연결 {done}/{count} — 노드ID {ble} 색 지정 완료", ))
 
     async def _save_netconf_coro(self, n: int, choices: dict, term: int) -> None:
         # 1) 각 큐브에 통신방식 세팅 저장(재부팅 없이). vid1=아그리게이터(0xFE), 그 외=멤버 중계.
