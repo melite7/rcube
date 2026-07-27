@@ -1,6 +1,6 @@
 #include "rcube_cmd.h"
-#include "board_led.h"
 #include "rcube_config.h"
+#include "rcube_status.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -71,7 +71,8 @@ void rcube_cmd_report_members(uint8_t members_connected)
 /* ---- 개별 명령 처리 -------------------------------------------------- */
 
 /* E0 SetSK6812LED: payload = [n][R,G,B]×n.
- * 온보드 LED는 1개뿐이므로 LED0 색을 대표로 점등하고 전체 세트는 로깅한다.
+ * 상위(PC/허브)가 지정한 색 = 비고정형 단계의 "가상 노드ID 색"이다(기획서 5장).
+ * 점멸/점등 여부는 rcube_status의 모드가 정하므로 여기서는 색만 넘긴다.
  * (자기 대상 프레임에서만 호출된다 — 멤버 대상은 상위에서 중계 처리) */
 static uint8_t handle_set_led(const uint8_t *p, uint16_t len)
 {
@@ -84,19 +85,24 @@ static uint8_t handle_set_led(const uint8_t *p, uint16_t len)
         return RCUBE_RC_BAD_LENGTH;
     }
     if (n == 0) {
-        board_led_set_node(0, 0, 0);   /* 노드LED 소등 */
+        rcube_status_set_color(0, 0, 0);   /* 노드LED 소등 */
         ESP_LOGI(TAG, "SetSK6812LED: n=0 → off");
         return RCUBE_RC_OK;
     }
     uint8_t r = p[1], g = p[2], b = p[3];   /* LED0 색을 대표로 사용(노드LED에 적용) */
-    board_led_set_node(r, g, b);
-    ESP_LOGI(TAG, "SetSK6812LED: n=%u, led0=(%u,%u,%u) → 온보드 점등", n, r, g, b);
+    rcube_status_set_color(r, g, b);
+    ESP_LOGI(TAG, "SetSK6812LED: n=%u, led0=(%u,%u,%u) → 지정색 적용", n, r, g, b);
     return RCUBE_RC_OK;
 }
 
-/* A0 SetMultiroleAggregator: payload = [ConnectionLinkCount][GroupMode] (+ vids).
- * 이 큐브를 아그리게이터로 승격, 자기 RED 점등 후 멤버 스캔·연결을 시작한다.
- * 멤버가 붙을 때마다 멀티롤 레이어가 rcube_cmd_report_members()로 0xA1을 보낸다. */
+/* A0 SetMultiroleAggregator: payload = [ConnectionLinkCount][GroupMode] (+ flags).
+ * 이 큐브를 BLE 허브(멀티롤)로 승격하고 멤버 스캔·연결을 시작한다.
+ * 멤버가 붙을 때마다 멀티롤 레이어가 rcube_cmd_report_members()로 0xA1을 보낸다.
+ *
+ * 허브 LED(기획서 5장 [ID 표시용 칼라LED 점등 규칙] · 7.2-7):
+ *   - 비고정형 초기구성(노드ID 미할당) → 가상1 = Red
+ *   - 고정형 재연결(노드ID 저장됨)     → 자기 저장 노드ID 색 (무조건 빨강 아님)
+ *   두 경우 모두 담당 멤버가 전원 연결되기 전엔 점멸(HUB_WAIT), 완료 시 상시 점등. */
 static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
 {
     if (len < 2) {
@@ -104,14 +110,22 @@ static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
     }
     uint8_t link_count = p[0];
     uint8_t group_mode = p[1];
-    uint8_t flags = (len >= 3) ? p[2] : 0;   /* bit0=순서고정 연결(NN 오름차순) */
 
-    board_led_set_node(255, 0, 0);   /* 아그리게이터 = 노드1 = Red(노드LED) */
-    ESP_LOGI(TAG, "SetMultiroleAggregator: total=%u, group_mode=0x%02x, flags=0x%02x → 승격(RED)",
-             link_count, group_mode, flags);
+    uint8_t node_id = rcube_config_node_id();
+    uint8_t r, g, b;
+    if (node_id != 0) {
+        rcube_status_node_color(node_id, &r, &g, &b);   /* 고정형: 자기 노드ID 색 */
+    } else {
+        r = 255; g = 0; b = 0;                          /* 비고정형: 가상1 = Red */
+    }
+    rcube_status_set_color(r, g, b);
+    rcube_status_set_mode(RCUBE_LED_HUB_WAIT);
+    ESP_LOGI(TAG, "SetMultiroleAggregator: total=%u, group_mode=0x%02x → BLE 허브 승격 "
+                  "(node=0x%02x, %s, 멤버 대기 점멸)",
+             link_count, group_mode, node_id, node_id ? "고정형/노드색" : "비고정형/Red");
 
     if (s_ops.agg_start != NULL) {
-        s_ops.agg_start(link_count, group_mode, flags);   /* 멤버 스캔·연결 시작(비동기) */
+        s_ops.agg_start(link_count, group_mode);   /* 멤버 스캔·연결 시작(비동기) */
     } else {
         ESP_LOGW(TAG, "agg_start 미등록 → 멤버 연결 불가, 0xA1(0)만 회신");
         rcube_cmd_report_members(0);
@@ -181,19 +195,42 @@ static uint8_t handle_set_node_config(uint8_t target, const uint8_t *p, uint16_t
         schedule_reboot();
         return RCUBE_RC_OK;
     }
-    case RCUBE_D3_SUB_FIX_ORDER: {
-        /* 이 큐브(아그리게이터/첫 큐브)는 노드1로 저장. 멤버들은 아그리게이터가
-         * 각자 가상ID를 노드ID로 저장시킨다(ops.fix_order). 전체 재부팅. */
-        if (rcube_config_set_node_id(1) != ESP_OK) return RCUBE_RC_FLASH_FAIL;
-        int members = (s_ops.fix_order != NULL) ? s_ops.fix_order() : 0;
-        ESP_LOGI(TAG, "D3 FIX_ORDER: 자기=노드1, 멤버 %d개에 순서 저장 지시 → 재부팅", members);
-        schedule_reboot();
-        return RCUBE_RC_OK;
-    }
     default:
         ESP_LOGW(TAG, "D3 알 수 없는 subcmd 0x%02x", sub);
         return RCUBE_RC_BAD_PARAM;
     }
+}
+
+/* D4 GetNodeConfig 회신: payload = [group_id, node_id, cmf, term_id].
+ * 멤버 큐브의 저장 결과를 PC가 확인할 수 있게 하는 관측 경로(기획서 7.2-3 검증용).
+ * 멤버가 보낸 회신은 아그리게이터가 notify를 받아 PC로 중계한다(ble_multirole). */
+static void reply_node_config(void)
+{
+    if (s_ops.send == NULL) {
+        return;
+    }
+    uint8_t f[HEADER_LEN + 4];
+    uint16_t total = sizeof(f);
+    put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_GetNodeConfig, total);
+    f[4] = rcube_config_group_id();
+    f[5] = rcube_config_node_id();
+    f[6] = rcube_config_cmf();
+    f[7] = rcube_config_term_id();
+    s_ops.send(f, total);
+    ESP_LOGI(TAG, "→ 0xD4 회신: group=0x%02x node=0x%02x cmf=%u term=0x%02x",
+             f[4], f[5], f[6], f[7]);
+}
+
+/* D7 ResetConfig: 공장 초기화(노드ID=0, CMF=BLE, 종단ID=0) 후 재부팅.
+ * 기획서 7.3 [노드ID/세팅 초기화 - 공통]. 브로드캐스트면 전 멤버로 팬아웃된다. */
+static uint8_t handle_reset_config(void)
+{
+    if (rcube_config_reset_factory() != ESP_OK) {
+        return RCUBE_RC_FLASH_FAIL;
+    }
+    ESP_LOGW(TAG, "D7 ResetConfig: 공장 초기화 완료 → 재부팅(비고정형으로 복귀)");
+    schedule_reboot();
+    return RCUBE_RC_OK;
 }
 
 /* ---- 파서 + 디스패처 ------------------------------------------------- */
@@ -248,6 +285,18 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
             s_ops.forward_all(data, len);
         }
         rc = handle_set_node_config(target, payload, plen);
+        reply_cmd_ack(op, rc);
+        break;
+
+    case RCUBE_OP_GetNodeConfig:
+        reply_node_config();   /* 회신 자체가 응답이므로 CmdAck 생략 */
+        break;
+
+    case RCUBE_OP_ResetConfig:
+        if (target == RCUBE_ADDR_BROADCAST && s_ops.forward_all != NULL) {
+            s_ops.forward_all(data, len);   /* 전 멤버도 초기화 */
+        }
+        rc = handle_reset_config();
         reply_cmd_ack(op, rc);
         break;
 

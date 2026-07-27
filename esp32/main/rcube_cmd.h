@@ -9,8 +9,11 @@
  * 위임한다. → 이 레이어는 NimBLE를 모른다.
  *
  * 구현 범위:
- *   - E0 SetSK6812LED         : payload=[n][R,G,B]×n → 온보드 LED 점등, CmdAck 회신
- *   - A0 SetMultiroleAggregator: 자기 RED + 아그리게이터 승격(ops.agg_start 위임)
+ *   - E0 SetSK6812LED         : payload=[n][R,G,B]×n → 노드LED 지정색, CmdAck 회신
+ *   - A0 SetMultiroleAggregator: BLE 허브 승격(ops.agg_start 위임) + 허브색 점멸
+ *   - D3 SetNodeConfig        : 그룹/노드ID/통신방식(CMF) 저장, 재부팅
+ *   - D4 GetNodeConfig        : [group, node, cmf, term] 회신(저장 결과 확인용)
+ *   - D7 ResetConfig          : 공장 초기화 후 재부팅(비고정형 복귀)
  *   - 자기 대상이 아닌 프레임   : 아그리게이터면 멤버로 중계(ops.forward)
  *   - 그 외 OpCode            : 로깅 + CmdAck(BAD_OPCODE) 회신
  */
@@ -24,20 +27,18 @@ typedef int (*rcube_send_fn)(const uint8_t *frame, uint16_t len);
 /* 명령 레이어가 전송계층에 위임하는 동작들. NULL이면 해당 기능 미지원. */
 typedef struct {
     rcube_send_fn send;                                  /* PC로 프레임 회신 */
-    void (*agg_start)(uint8_t link_count, uint8_t group_mode, uint8_t flags); /* 아그리게이터 승격 */
-    void (*agg_stop)(void);                              /* 아그리게이터 해제 */
+    void (*agg_start)(uint8_t link_count, uint8_t group_mode); /* BLE 허브 승격 */
+    void (*agg_stop)(void);                              /* BLE 허브 해제 */
     int  (*forward)(uint8_t target_id, const uint8_t *frame, uint16_t len); /* 멤버 중계 */
     int  (*forward_all)(const uint8_t *frame, uint16_t len);  /* 전 멤버로 브로드캐스트 중계 */
-    int  (*fix_order)(void);   /* 순서고정: 각 멤버에 자기 가상ID를 노드ID로 저장시킴 */
 } rcube_cmd_ops_t;
 
 /* ---- SetNodeConfig(D3) 서브커맨드 (payload[0]) — 펌웨어/앱 공유 계약 ----
  *   SET_GROUP : payload=[0x01, group_id]  그룹번호 저장 후 재부팅(브로드캐스트 팬아웃)
- *   FIX_ORDER : payload=[0x02]            자기=노드1 저장 + 아그리게이터가 멤버들에
- *                                          각자 가상ID를 노드ID로 저장시킴, 전체 재부팅
- *   SET_NODE  : payload=[0x03, node_id]   노드ID 저장 후 재부팅(아그리게이터→멤버 or 단일) */
+ *   SET_NODE  : payload=[0x03, node_id]   노드ID 저장 후 재부팅(아그리게이터→멤버 or 단일)
+ * ※ 0x02(FIX_ORDER)는 기획서 7.5 [새 방식]에서 폐기됐다 — 노드ID 저장 여부가 곧
+ *   고정형 판정이므로 별도의 고정형 전환 명령이 없다. 값은 재사용하지 않는다. */
 #define RCUBE_D3_SUB_SET_GROUP  0x01u
-#define RCUBE_D3_SUB_FIX_ORDER  0x02u
 #define RCUBE_D3_SUB_SET_NODE   0x03u
 /* SET_NETCONF: payload=[0x04, node_id, cmf(0=BLE/1=CAN), term_node_id]. 저장만(재부팅 X). */
 #define RCUBE_D3_SUB_SET_NETCONF 0x04u

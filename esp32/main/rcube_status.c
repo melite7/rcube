@@ -12,7 +12,7 @@ typedef struct { uint8_t r, g, b; } rgb_t;
 
 /* 자릿수/노드ID(0~9) → 색. 기획서 노드ID 규약(0=White 1=Red 2=Green …). */
 static const rgb_t PALETTE[10] = {
-    {255, 255, 255},  /* 0 White */
+    {255, 255, 255},  /* 0 White(미할당) */
     {255,   0,   0},  /* 1 Red */
     {  0, 255,   0},  /* 2 Green */
     {  0,   0, 255},  /* 3 Blue */
@@ -26,14 +26,39 @@ static const rgb_t PALETTE[10] = {
 static const rgb_t WHITE = {255, 255, 255};
 static const rgb_t BLACK = {0, 0, 0};
 
-/* 노드LED 소유권 플래그(다른 태스크에서 set, 노드 태스크에서 read). */
-static volatile bool s_config;   /* 설정모드: 흰색 0.25s 빠른 점멸 */
-static volatile bool s_yield;    /* BLE/명령 레이어가 노드LED 소유(연결/광고) */
-static volatile bool s_connect_entered;  /* 연결모드 최초 진입 여부 */
+/* 점멸 주기(기획서 5장): 일반 1초, 설정모드 0.25초. */
+#define BLINK_MS        1000
+#define CONFIG_BLINK_MS  250
+/* 모드/색 변경을 이 간격으로 재확인해 페이즈를 즉시 끊는다. */
+#define TICK_MS           25
+
+/* 노드 태스크 외부에서 set, 노드 태스크에서 read. */
+static volatile rcube_led_mode_t s_mode = RCUBE_LED_IDLE;
+static volatile bool s_color_set;       /* 상위 지정색 사용 여부 */
+static volatile uint8_t s_cr, s_cg, s_cb;
+static volatile bool s_connect_entered; /* 연결모드 최초 진입 여부 */
 
 static rgb_t color_for_digit(uint8_t d)
 {
     return (d < 10) ? PALETTE[d] : PALETTE[0];
+}
+
+void rcube_status_node_color(uint8_t node_id, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    rgb_t c = color_for_digit(node_id);
+    if (r) *r = c.r;
+    if (g) *g = c.g;
+    if (b) *b = c.b;
+}
+
+/* 지금 표시해야 할 색: 상위 지정색이 있으면 그것, 없으면 자기 노드ID 색. */
+static rgb_t current_color(void)
+{
+    if (s_color_set) {
+        rgb_t c = { s_cr, s_cg, s_cb };
+        return c;
+    }
+    return color_for_digit(rcube_config_node_id());
 }
 
 /* ---- 그룹번호 LED(LED2): 전원 내내 ---------------------------------- */
@@ -51,21 +76,27 @@ static void group_task(void *arg)
     }
 }
 
-/* ---- 노드ID LED(LED0·LED1) --------------------------------------------
- * color를 ms 동안 켠다. 도중 소유권이 넘어가면(s_yield) 즉시 true(중단) 반환.
- * 설정모드 전환(s_config) 역시 현재 페이즈를 끊도록 change 플래그로 감시. */
-static bool node_show(rgb_t color, uint32_t ms, bool config_now)
+/* ---- 노드ID LED(LED0·LED1) ------------------------------------------
+ * color를 ms 동안 표시한다. 도중 모드가 바뀌거나 이번 주기의 기준색(base)이
+ * 달라지면 즉시 true(중단) 반환.
+ *
+ * ※ 비교 기준이 base인 이유: 점멸의 OFF 구간에서는 출력색이 검정이므로,
+ *   출력색과 current_color()를 비교하면 매 틱마다 "색이 바뀌었다"고 오판해
+ *   OFF 구간이 0ms로 끊긴다(= 상시 점등처럼 보임). */
+static bool node_show(rgb_t color, uint32_t ms, rcube_led_mode_t mode_now, rgb_t base)
 {
-    if (s_yield) {
-        return true;
-    }
     board_led_set_node(color.r, color.g, color.b);
-    const uint32_t chunk = 25;
-    for (uint32_t t = 0; t < ms; t += chunk) {
-        if (s_yield || s_config != config_now) {
-            return true;   /* 소유권 이전 또는 모드 변경 → 페이즈 중단 */
+    for (uint32_t t = 0; t < ms; t += TICK_MS) {
+        if (s_mode != mode_now) {
+            return true;   /* 모드 전이 → 페이즈 중단 */
         }
-        vTaskDelay(pdMS_TO_TICKS(chunk));
+        if (mode_now != RCUBE_LED_CONFIG) {
+            rgb_t now = current_color();
+            if (now.r != base.r || now.g != base.g || now.b != base.b) {
+                return true;   /* 상위 지정색 변경 → 즉시 반영 */
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(TICK_MS));
     }
     return false;
 }
@@ -74,63 +105,86 @@ static void node_task(void *arg)
 {
     ESP_LOGI(TAG, "node LED 표시 시작(LED0·1)");
     while (1) {
-        if (s_yield) {
-            vTaskDelay(pdMS_TO_TICKS(50));   /* BLE/명령이 소유 — 손대지 않음 */
-            continue;
-        }
-        if (s_config) {
+        rcube_led_mode_t mode = s_mode;
+        rgb_t base = current_color();   /* 이번 주기 동안의 기준색 */
+        switch (mode) {
+        case RCUBE_LED_CONFIG:
             /* 설정모드: 흰색 0.25s ON / 0.25s OFF 빠른 점멸 */
-            node_show(WHITE, 250, true);
-            node_show(BLACK, 250, true);
-        } else {
-            /* identity: 노드ID 색 1s ON / 1s OFF */
-            rgb_t c = color_for_digit(rcube_config_node_id());
-            node_show(c, 1000, false);
-            node_show(BLACK, 1000, false);
+            if (node_show(WHITE, CONFIG_BLINK_MS, mode, base)) break;
+            node_show(BLACK, CONFIG_BLINK_MS, mode, base);
+            break;
+
+        case RCUBE_LED_LINKED:
+            /* 연결 완료: 상시 점등 (TICK 단위로 색/모드만 재확인) */
+            node_show(base, BLINK_MS, mode, base);
+            break;
+
+        case RCUBE_LED_IDLE:
+        case RCUBE_LED_HUB_WAIT:
+        default:
+            /* 미연결 / 허브 멤버 대기: 1s ON / 1s OFF 점멸 */
+            if (node_show(base, BLINK_MS, mode, base)) break;
+            node_show(BLACK, BLINK_MS, mode, base);
+            break;
         }
     }
 }
 
-void rcube_status_start_identity(void)
+void rcube_status_start(void)
 {
-    s_config = false;
-    s_yield = false;
+    s_mode = RCUBE_LED_IDLE;
+    s_color_set = false;
     s_connect_entered = false;
     xTaskCreatePinnedToCore(group_task, "grpled", 3072, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(node_task, "nodeled", 3072, NULL, 4, NULL, 0);
 }
 
+void rcube_status_set_mode(rcube_led_mode_t mode)
+{
+    /* 설정모드는 재부팅/명시 해제 전까지 다른 모드로 덮지 않는다(기획서 5장). */
+    if (s_mode == RCUBE_LED_CONFIG && mode != RCUBE_LED_CONFIG) {
+        return;
+    }
+    if (s_mode != mode) {
+        ESP_LOGI(TAG, "LED 모드 %d → %d", (int)s_mode, (int)mode);
+        s_mode = mode;
+    }
+}
+
+rcube_led_mode_t rcube_status_mode(void)
+{
+    return s_mode;
+}
+
+void rcube_status_set_color(uint8_t r, uint8_t g, uint8_t b)
+{
+    s_cr = r; s_cg = g; s_cb = b;
+    s_color_set = true;
+}
+
+void rcube_status_clear_color(void)
+{
+    s_color_set = false;
+}
+
 bool rcube_status_enter_connect_mode(void)
 {
-    s_yield = true;   /* 광고/연결 색을 ble_rcube가 표시 */
     if (s_connect_entered) {
         return false;
     }
     s_connect_entered = true;
-    ESP_LOGI(TAG, "연결모드 진입(노드LED → BLE 소유)");
+    ESP_LOGI(TAG, "연결모드 진입");
     return true;
 }
 
 void rcube_status_enter_config_mode(void)
 {
-    s_config = true;
-    s_yield = false;   /* 노드LED를 설정모드 흰색 점멸이 소유 */
+    s_color_set = false;
+    s_mode = RCUBE_LED_CONFIG;
     ESP_LOGI(TAG, "설정모드 진입(노드LED 흰색 0.25s 점멸)");
-}
-
-void rcube_status_on_connected(void)
-{
-    s_yield = true;   /* 연결됨 — 상위 지정색이 표시되도록 소유권 이전 */
-}
-
-void rcube_status_on_disconnected(void)
-{
-    if (s_config) {
-        s_yield = false;   /* 설정모드였다면 흰색 점멸 재개 */
-    }
 }
 
 bool rcube_status_in_config_mode(void)
 {
-    return s_config;
+    return s_mode == RCUBE_LED_CONFIG;
 }

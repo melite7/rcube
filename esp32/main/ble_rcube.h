@@ -26,8 +26,9 @@ extern const ble_uuid128_t rcube_chr_uuid;
 /* NimBLE 스택 초기화(광고 시작 안 함). app_main에서 1회 호출. */
 void ble_rcube_init(void);
 
-/* 광고 시작을 요청한다(일반 이름 RCUBEROBOT). 임의 태스크에서 호출 가능. */
-void ble_rcube_start_advertising(void);
+/* 연결모드 광고 시작을 요청한다(일반 이름 RCUBEROBOT). 임의 태스크에서 호출 가능.
+ * CMF=1(CAN) 큐브는 BLE로 광고하지 않으므로 false를 돌려준다(기획서 5장/7.2-8). */
+bool ble_rcube_start_advertising(void);
 
 /* 설정모드 광고를 시작한다(이름 RCUBECONFIG). 이미 광고 중이면 이름을 바꿔 재시작. */
 void ble_rcube_start_config_advertising(void);

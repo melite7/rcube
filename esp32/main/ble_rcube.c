@@ -41,16 +41,8 @@ static void update_device_name(void)
     ble_svc_gap_device_name_set(name);
 }
 
-/* LED 상태색(순수 색상; 실제 밝기는 board_led의 LED_BRIGHTNESS로 스케일). */
-#define LED_IDLE_R 0
-#define LED_IDLE_G 0
-#define LED_IDLE_B 255     /* 파랑 = 대기(부팅 성공) */
-#define LED_ADV_R 0
-#define LED_ADV_G 255
-#define LED_ADV_B 255      /* 청록 = 광고중(발견 가능) */
-#define LED_CONN_R 0
-#define LED_CONN_G 255
-#define LED_CONN_B 0       /* 초록 = 연결됨 */
+/* 노드LED는 rcube_status가 전담한다(기획서 5장 [ID 표시용 칼라LED 점등 규칙]).
+ * 이 파일은 연결 상태 전이만 통보하고 색·점멸은 직접 만지지 않는다. */
 
 /* ---- 커스텀 GATT 서비스 (연결 후 상호작용 확인용) --------------------
  * Service : 52434245-0000-1000-8000-00805f9b34fb  (ASCII "RCBE")
@@ -207,10 +199,8 @@ static void adv_start(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_advertising = true;
     xSemaphoreGive(s_lock);
-    /* 설정모드에선 노드LED가 흰색 점멸 중이므로 광고색(cyan)으로 덮지 않는다. */
-    if (!rcube_status_in_config_mode()) {
-        board_led_set_node(LED_ADV_R, LED_ADV_G, LED_ADV_B);
-    }
+    /* 광고중 = 아직 미연결 → IDLE(1초 점멸). 설정모드면 set_mode가 무시한다. */
+    rcube_status_set_mode(RCUBE_LED_IDLE);
     ESP_LOGI(TAG, "advertising as \"%s\" (connectable)", name);
 }
 
@@ -239,8 +229,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_advertising = false;
             s_conn_handle = event->connect.conn_handle;
             xSemaphoreGive(s_lock);
-            rcube_status_on_connected();   /* 노드LED 소유권 이전(상위 지정색 표시) */
-            board_led_set_node(LED_CONN_R, LED_CONN_G, LED_CONN_B);
+            /* 연결 완료 → 상시 점등. 색은 고정형이면 자기 노드ID 색, 비고정형이면
+             * 상위가 곧 보내줄 가상 노드ID 색(E0)이 덮어쓴다. */
+            rcube_status_set_mode(RCUBE_LED_LINKED);
             ESP_LOGI(TAG, "connected (handle=%d)", event->connect.conn_handle);
         } else {
             ESP_LOGW(TAG, "connect failed; status=%d, resume adv",
@@ -260,10 +251,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         xSemaphoreGive(s_lock);
         /* PC 연결이 끊기면 아그리게이터 역할도 해제(멤버 전원 종료). */
         ble_multirole_stop_aggregator();
-        rcube_status_on_disconnected();   /* 설정모드였다면 흰색 점멸 재개 */
-        if (!rcube_status_in_config_mode()) {
-            board_led_set_node(LED_IDLE_R, LED_IDLE_G, LED_IDLE_B);
-        }
+        /* 상위가 지정했던 가상 노드ID 색을 버리고 미연결 표시로 되돌린다
+         * (기획서 5장: 비고정형 가상색은 저장되지 않고 reset 후 흰색 점멸). */
+        rcube_status_clear_color();
+        rcube_status_set_mode(RCUBE_LED_IDLE);
         try_advertise();   /* 재연결을 위해 광고 재개 */
         return 0;
 
@@ -361,7 +352,6 @@ void ble_rcube_init(void)
         .agg_stop    = ble_multirole_stop_aggregator,
         .forward     = ble_multirole_forward,
         .forward_all = ble_multirole_broadcast,
-        .fix_order   = ble_multirole_fix_order,
     };
     rcube_cmd_init(&cmd_ops);
 
@@ -370,13 +360,23 @@ void ble_rcube_init(void)
              ble_svc_gap_device_name());
 }
 
-void ble_rcube_start_advertising(void)
+bool ble_rcube_start_advertising(void)
 {
+    /* 기획서 5장 [연결모드 진입 동작 - ECF=0]·7.2-8:
+     *   CMF=0(BLE) 큐브만 연결모드에서 RCUBEROBOT으로 광고한다.
+     *   CMF=1(CAN) 큐브는 CAN 하트비트로 존재를 알리므로 BLE 광고를 하지 않는다.
+     *   (CAN으로 세팅한 큐브를 되돌리는 복구 경로는 설정모드 광고 = RCUBECONFIG.) */
+    if (rcube_config_cmf() == 1) {
+        ESP_LOGW(TAG, "CMF=CAN 큐브 → 연결모드 BLE 광고 생략(CAN 하트비트로 연결). "
+                      "BLE로 되돌리려면 버튼 3초 롱프레스로 설정모드 진입.");
+        return false;
+    }
     s_config_name = false;   /* 일반 이름(RCUBEROBOT) */
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_start_requested = true;
     xSemaphoreGive(s_lock);
     try_advertise();
+    return true;
 }
 
 void ble_rcube_start_config_advertising(void)

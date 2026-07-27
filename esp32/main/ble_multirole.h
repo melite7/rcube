@@ -19,16 +19,15 @@
 
 #include <stdint.h>
 
-/* 순서고정 연결 플래그(A0 flags bit0): 멤버를 광고이름 NN 오름차순으로 연결. */
-#define RCUBE_AGG_FLAG_ORDERED 0x01u
-
-/* 아그리게이터 승격: 멤버 스캔·연결 시작(link_count = 본인 포함 총 N).
- * flags & RCUBE_AGG_FLAG_ORDERED 면 NN=2,3,… 순서대로만 연결한다. */
-void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode, uint8_t flags);
-
-/* 순서고정: 현재 READY 멤버 각각에게 "자기 가상ID를 노드ID로 저장"(D3 SET_NODE)을
- * 지시한다. 지시한 멤버 수를 반환. 아그리게이터가 아니면 음수. */
-int ble_multirole_fix_order(void);
+/* BLE 허브 승격: 멤버 스캔·연결 시작(link_count = 본인 포함 총 N).
+ *
+ * 고정형/비고정형은 기획서 7.5 [새 방식]대로 "저장 노드ID 유무"로 스스로 판정한다
+ * (별도 플래그·전환 명령 없음):
+ *   - 자기 node_id == 0 (비고정형 초기구성) : 아무 R큐브나 연결 순서대로 붙이고
+ *     가상ID 2,3,…을 배정한다.
+ *   - 자기 node_id != 0 (고정형 재연결)     : 광고이름의 NN≥1인 큐브만 붙이고
+ *     그 NN을 그대로 가상ID로 쓴다(연결 순서 무관). */
+void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode);
 
 /* 아그리게이터 해제: 모든 멤버 연결 종료·스캔 중지·상태 초기화. */
 void ble_multirole_stop_aggregator(void);

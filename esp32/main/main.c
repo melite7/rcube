@@ -1,12 +1,14 @@
 /*
- * R큐브 메인보드 펌웨어 — app_main (Phase 1: BLE 연결 골격)
+ * R큐브 메인보드 펌웨어 — app_main
  * ------------------------------------------------------------------
- * 동작:
- *   1) 전원 인가 → 부팅 → 온보드 SK6812를 파란색으로 점등(부팅 성공 표시).
- *   2) BOOT 버튼(GPIO0)을 누르면 → 자신을 "RCUBE00.00"으로 BLE 광고 시작.
- *      외부(폰/PC)에서 이 이름으로 찾아 연결할 수 있다.
+ * 동작(기획서 5장 [버튼]·[LED]·[소리], 7.1~7.2 연결 절차):
+ *   1) 전원 인가 → 설정(NVS) 로드 → 노드ID 색 1초 점멸(미할당이면 흰색)
+ *      + 부팅음(노드ID 있으면 자기 멜로디, 없으면 디폴트).
+ *   2) BOOT 버튼 짧게 → 연결모드. CMF=0(BLE)이면 "RCUBEROBOT.GG.NN"으로 광고하고,
+ *      CMF=1(CAN)이면 광고 없이 CAN 하트비트로 상위가 붙는다.
+ *   3) BOOT 버튼 3초 롱프레스 → 설정모드("RCUBECONFIG.GG.NN", 흰색 0.25초 점멸).
  *
- * LED 상태색: 파랑=대기, 청록=광고중, 초록=연결됨. (ble_rcube.c에서 갱신)
+ * 노드LED 표시는 rcube_status가 전담한다(모드=점멸/점등, 색=노드ID 또는 상위 지정).
  *
  * 코어 배치 (로드맵 12.2):
  *   - Core 1 : 실시간 모션(고정주기 키프레임 송출 + 센서 수집).
@@ -117,8 +119,16 @@ static void button_task(void *arg)
                 if (!config_triggered) {
                     bool first = rcube_status_enter_connect_mode();
                     if (first) {
-                        ESP_LOGI(TAG, "BOOT short press -> connect mode: start advertising");
-                        ble_rcube_start_advertising();
+                        /* 기획서 5장 [소리 규칙]: 연결모드로 갈 때 멤버 큐브는
+                         * 연결대기 멜로디를 연주한다(edge central 멜로디는 7.3에서). */
+                        rcube_buzzer_play(RCUBE_MELODY_LINK_WAIT);
+                        /* CMF=0(BLE)면 광고 시작, CMF=1(CAN)이면 광고 없이
+                         * CAN 하트비트로 연결된다(부팅 시 이미 기동). */
+                        if (ble_rcube_start_advertising()) {
+                            ESP_LOGI(TAG, "BOOT short press -> connect mode: BLE 광고 시작");
+                        } else {
+                            ESP_LOGI(TAG, "BOOT short press -> connect mode: CAN 큐브(광고 없음)");
+                        }
                     } else {
                         ESP_LOGI(TAG, "BOOT short press (already in connect/config)");
                     }
@@ -164,10 +174,15 @@ void app_main(void)
     /* BLE 스택 초기화(광고는 버튼을 눌러야 시작). */
     ble_rcube_init();
 
-    /* 부팅 성공: 그룹번호 색상 표시 시작 + START(시작음) 재생. */
-    rcube_status_start_identity();
-    rcube_buzzer_play(RCUBE_MELODY_START);
-    ESP_LOGI(TAG, "boot OK -> identity(group color) + START melody");
+    /* 부팅 성공: 상태 LED 태스크 기동 + 부팅음.
+     * 기획서 5장 [소리 규칙]: 노드ID가 있으면 자기 멜로디(ID1 C4, ID2 D4 …)를
+     * 2번, 없으면(비고정형) 디폴트 켜짐 멜로디를 연주한다. */
+    rcube_status_start();
+    rcube_melody_id_t boot_melody = rcube_melody_node_id(rcube_config_node_id());
+    rcube_buzzer_play(boot_melody);
+    ESP_LOGI(TAG, "boot OK -> LED(노드ID %s) + %s melody",
+             rcube_config_node_id() ? "색 점멸" : "흰색 점멸(미할당)",
+             rcube_melody(boot_melody)->name);
 
     /* IMU(BMI088) SPI 환경 준비 + 검증. 검출되면 주기 읽기 태스크 기동. */
     bmi088_init();
@@ -201,5 +216,7 @@ void app_main(void)
         ESP_LOGI(TAG, "tasks created successfully");
     }
 
-    ESP_LOGI(TAG, "boot done. Press BOOT button to start BLE advertising as \"RCUBE00.00\".");
+    ESP_LOGI(TAG, "boot done. 버튼 짧게=연결모드(%s), 3초 롱프레스=설정모드(RCUBECONFIG.%02u.%02u).",
+             rcube_config_cmf() == 1 ? "CAN 하트비트" : "BLE 광고 RCUBEROBOT",
+             rcube_config_group_id(), rcube_config_node_id());
 }

@@ -2,6 +2,8 @@
 #include "ble_rcube.h"
 #include "rcube_cmd.h"
 #include "rcube_buzzer.h"
+#include "rcube_config.h"
+#include "rcube_status.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -41,8 +43,9 @@ typedef struct {
     uint16_t     svc_start;
     uint16_t     svc_end;
     uint16_t     chr_val_handle;
+    uint16_t     cccd_handle;  /* 0x2902 — 멤버 회신(notify) 구독용 */
     uint8_t      vid;          /* PC와 맞춘 가상 노드 ID(2..N) */
-    uint8_t      nn;           /* 광고이름에서 읽은 노드ID(순서고정 연결용) */
+    uint8_t      nn;           /* 광고이름에서 읽은 노드ID(고정형 식별용) */
 } member_t;
 
 /* --- 상태 (모두 NimBLE 호스트 태스크 단일 스레드에서만 접근) --- */
@@ -158,7 +161,7 @@ static void scan_if_needed(void)
 }
 
 /* ---- 공개 API -------------------------------------------------------- */
-void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode, uint8_t flags)
+void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode)
 {
     /* 기존 아그리게이터 상태가 있으면 먼저 정리. */
     ble_multirole_stop_aggregator();
@@ -172,12 +175,14 @@ void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode, uint
     s_active = true;
     s_target_members = members;
     s_group_mode = group_mode;
-    s_ordered = (flags & RCUBE_AGG_FLAG_ORDERED) != 0;
-    s_next_vid = 2;            /* 아그리게이터=1(0xFE), 멤버는 2부터 */
+    /* 기획서 7.5: 노드ID 저장 여부가 곧 고정형 판정(별도 전환 명령 없음). */
+    s_ordered = (rcube_config_node_id() != 0);
+    s_next_vid = 2;            /* 허브=1(0xFE), 멤버는 2부터 */
     s_connect_pending = false;
 
-    ESP_LOGI(TAG, "aggregator 시작: 목표 멤버 %u대(group_mode=0x%02x, %s)",
-             members, group_mode, s_ordered ? "순서고정 NN순" : "연결순");
+    ESP_LOGI(TAG, "BLE 허브 시작: 목표 멤버 %u대(group_mode=0x%02x, %s)",
+             members, group_mode,
+             s_ordered ? "고정형=광고 NN 기준" : "비고정형=연결 순서");
 
     if (members == 0) {
         rcube_cmd_report_members(0);   /* R1 상당 — 멤버 없음 */
@@ -273,43 +278,63 @@ int ble_multirole_broadcast(const uint8_t *frame, uint16_t len)
     return sent;
 }
 
-int ble_multirole_fix_order(void)
-{
-    if (!s_active) {
-        return -1;
-    }
-    int sent = 0;
-    for (int i = 0; i < MAX_MEMBERS; i++) {
-        member_t *m = &s_members[i];
-        if (m->state != SLOT_READY) {
-            continue;
-        }
-        /* D3 SET_NODE 프레임: 이 멤버의 가상ID를 노드ID로 저장시킨다. */
-        uint8_t f[6];
-        uint16_t total = sizeof(f);
-        f[0] = RCUBE_ADDR_HUB;      /* 멤버가 자기 명령으로 처리 */
-        f[1] = RCUBE_OP_SetNodeConfig;
-        f[2] = (uint8_t)((total >> 8) & 0xFF);
-        f[3] = (uint8_t)(total & 0xFF);
-        f[4] = RCUBE_D3_SUB_SET_NODE;
-        f[5] = m->vid;              /* 저장할 노드ID = 가상ID */
-        int rc = ble_gattc_write_flat(m->conn_handle, m->chr_val_handle, f, total, NULL, NULL);
-        if (rc == 0) {
-            sent++;
-            ESP_LOGI(TAG, "fix_order: vid=%u 멤버에 노드ID 저장 지시", m->vid);
-        } else {
-            ESP_LOGW(TAG, "fix_order: vid=%u write 실패 rc=%d", m->vid, rc);
-        }
-    }
-    return sent;
-}
-
 uint8_t ble_multirole_member_count(void)
 {
     return count_ready();
 }
 
+/* ---- 멤버 READY 확정 -------------------------------------------------- */
+/* 특성(+가능하면 CCCD)까지 확보한 멤버를 READY로 올리고 PC에 보고한다. */
+static void member_ready(member_t *m)
+{
+    m->state = SLOT_READY;
+    /* 고정형이면 광고 nodeID(NN)를 그대로 가상ID로, 아니면 연결순서(2,3,…). */
+    m->vid = (s_ordered && m->nn >= 1) ? m->nn : s_next_vid++;
+    uint8_t ready = count_ready();
+    ESP_LOGI(TAG, "멤버 READY: conn=%u vid=%u chr=%u cccd=%u (%u/%u)",
+             m->conn_handle, m->vid, m->chr_val_handle, m->cccd_handle,
+             ready, s_target_members);
+    rcube_cmd_report_members(ready);
+    /* 멤버 1개 연결음, 담당 BLE 분기가 전부 붙으면 유닛구성완료 멜로디(기획서 5장). */
+    if (ready >= s_target_members) {
+        rcube_buzzer_play(RCUBE_MELODY_LINK_COMPLETED);
+        /* 허브 LED: 멤버 전원 연결 → 점멸에서 상시 점등으로. */
+        rcube_status_set_mode(RCUBE_LED_LINKED);
+    } else {
+        rcube_buzzer_play(RCUBE_MELODY_LINK);
+    }
+    scan_if_needed();   /* 더 필요하면 계속 스캔 */
+}
+
 /* ---- GATT 클라이언트 탐색 콜백 --------------------------------------- */
+/* CCCD(0x2902)를 찾아 notify를 구독한다. 멤버의 회신(CmdAck·D4 등)을 받아
+ * PC로 중계하기 위한 역방향 경로다. 실패해도 연결 자체는 유지한다. */
+static int dsc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    member_t *m = (member_t *)arg;
+    if (error->status == 0 && dsc != NULL) {
+        if (ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
+            m->cccd_handle = dsc->handle;
+        }
+        return 0;
+    }
+    if (!s_active || m->state != SLOT_DISCOVERING) {
+        return 0;
+    }
+    if (m->cccd_handle != 0) {
+        uint8_t val[2] = {0x01, 0x00};   /* notify enable */
+        int rc = ble_gattc_write_flat(conn_handle, m->cccd_handle, val, sizeof(val), NULL, NULL);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "멤버 conn=%u notify 구독 실패 rc=%d (회신 중계 불가)", conn_handle, rc);
+        }
+    } else {
+        ESP_LOGW(TAG, "멤버 conn=%u CCCD 없음 → 회신 중계 불가", conn_handle);
+    }
+    member_ready(m);
+    return 0;
+}
+
 static int chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                        const struct ble_gatt_chr *chr, void *arg)
 {
@@ -330,21 +355,13 @@ static int chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return 0;
     }
-    /* 멤버 READY. 가상ID 부여 후 PC에 0xA1 보고. */
-    m->state = SLOT_READY;
-    /* 고정형이면 광고 nodeID(NN)를 그대로 가상ID로, 아니면 연결순서(2,3,…). */
-    m->vid = (s_ordered && m->nn >= 1) ? m->nn : s_next_vid++;
-    uint8_t ready = count_ready();
-    ESP_LOGI(TAG, "멤버 READY: conn=%u vid=%u chr=%u (%u/%u)",
-             conn_handle, m->vid, m->chr_val_handle, ready, s_target_members);
-    rcube_cmd_report_members(ready);
-    /* 멤버 1개 연결음, 전원 연결되면 전체 완료 멜로디. */
-    if (ready >= s_target_members) {
-        rcube_buzzer_play(RCUBE_MELODY_LINK_COMPLETED);
-    } else {
-        rcube_buzzer_play(RCUBE_MELODY_LINK);
+    /* 회신 중계를 위해 CCCD를 찾아 구독한 뒤 READY로 올린다. */
+    int rc = ble_gattc_disc_all_dscs(conn_handle, m->chr_val_handle, m->svc_end,
+                                     dsc_disc_cb, m);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "descriptor 탐색 시작 실패 rc=%d → 구독 없이 진행", rc);
+        member_ready(m);
     }
-    scan_if_needed();   /* 더 필요하면 계속 스캔 */
     return 0;
 }
 
@@ -411,6 +428,10 @@ static int member_gap_event(struct ble_gap_event *event, void *arg)
         if (s_active) {
             if (was_ready) {
                 rcube_cmd_report_members(count_ready());   /* 멤버 수 감소 통지 */
+                /* 담당 멤버가 빠졌으므로 허브 LED는 다시 대기 점멸로. */
+                if (count_ready() < s_target_members) {
+                    rcube_status_set_mode(RCUBE_LED_HUB_WAIT);
+                }
             }
             scan_if_needed();   /* 빈자리 다시 채움 */
         }
@@ -420,6 +441,26 @@ static int member_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "멤버 mtu conn=%u mtu=%d", event->mtu.conn_handle, event->mtu.value);
         return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        /* 멤버가 보낸 회신(CmdAck·GetNodeConfig 등)을 PC로 그대로 올린다.
+         * 발신자를 알 수 있도록 target 바이트를 그 멤버의 가상ID로 재기입한다.
+         * (멤버는 자기를 허브로 알고 0xFE로 보내므로 그대로 두면 구분이 안 된다.) */
+        if (m->state != SLOT_READY) {
+            return 0;
+        }
+        uint8_t buf[FWD_BUF_MAX];
+        uint16_t len = 0;
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, buf, sizeof(buf), &len) != 0 || len < 4) {
+            ESP_LOGW(TAG, "멤버 vid=%u notify 파싱 실패(len=%u)", m->vid, len);
+            return 0;
+        }
+        buf[0] = m->vid;
+        if (ble_rcube_notify_pc(buf, len) == 0) {
+            ESP_LOGI(TAG, "멤버 vid=%u 회신 %u bytes → PC 중계 (op=0x%02x)", m->vid, len, buf[1]);
+        }
+        return 0;
+    }
 
     default:
         return 0;
