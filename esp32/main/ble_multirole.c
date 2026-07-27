@@ -49,9 +49,8 @@ typedef struct {
 static bool     s_active;
 static uint8_t  s_target_members;   /* 연결해야 할 멤버 수 = link_count-1 */
 static uint8_t  s_group_mode;
-static bool     s_ordered;          /* 순서고정 연결(NN 오름차순) */
-static uint8_t  s_next_nn;          /* 순서고정 시 다음에 연결할 NN(2부터) */
-static uint8_t  s_next_vid;         /* 비순서 시 다음 멤버 가상ID(2부터) */
+static bool     s_ordered;          /* 고정형: 광고 nodeID(NN)를 그대로 가상ID로 사용 */
+static uint8_t  s_next_vid;         /* 비고정형 시 다음 멤버 가상ID(2부터, 연결순서) */
 static bool     s_connect_pending;  /* 연결 시도 1건 진행 중(직렬화) */
 static member_t s_members[MAX_MEMBERS];
 
@@ -174,7 +173,6 @@ void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode, uint
     s_target_members = members;
     s_group_mode = group_mode;
     s_ordered = (flags & RCUBE_AGG_FLAG_ORDERED) != 0;
-    s_next_nn = 2;             /* 순서고정 시 멤버 NN은 2부터 */
     s_next_vid = 2;            /* 아그리게이터=1(0xFE), 멤버는 2부터 */
     s_connect_pending = false;
 
@@ -209,7 +207,6 @@ void ble_multirole_stop_aggregator(void)
     }
     s_target_members = 0;
     s_next_vid = 2;
-    s_next_nn = 2;
     s_ordered = false;
 }
 
@@ -335,8 +332,8 @@ static int chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     }
     /* 멤버 READY. 가상ID 부여 후 PC에 0xA1 보고. */
     m->state = SLOT_READY;
-    /* 순서고정이면 광고이름 NN을 그대로 가상ID로, 아니면 연결순서(2,3,…). */
-    m->vid = (s_ordered && m->nn >= 2) ? m->nn : s_next_vid++;
+    /* 고정형이면 광고 nodeID(NN)를 그대로 가상ID로, 아니면 연결순서(2,3,…). */
+    m->vid = (s_ordered && m->nn >= 1) ? m->nn : s_next_vid++;
     uint8_t ready = count_ready();
     ESP_LOGI(TAG, "멤버 READY: conn=%u vid=%u chr=%u (%u/%u)",
              conn_handle, m->vid, m->chr_val_handle, ready, s_target_members);
@@ -456,8 +453,10 @@ static int disc_gap_event(struct ble_gap_event *event, void *arg)
     uint8_t nn = 0;
     bool have_nn = parse_name_nn(fields.name, fields.name_len, &nn);
 
-    /* 순서고정 연결: 지금 필요한 NN(s_next_nn)과 정확히 같은 큐브만 연결. */
-    if (s_ordered && (!have_nn || nn != s_next_nn)) {
+    /* 고정형 연결: 저장 노드ID(NN≥1)가 있는 큐브만 연결한다(가상ID=NN).
+     * 연결 순서는 무관 — 각 멤버는 광고의 nodeID로 식별되어 그 색을 받는다.
+     * (비연속 노드ID·혼합유닛의 BLE 부분집합도 처리됨.) */
+    if (s_ordered && (!have_nn || nn < 1)) {
         return 0;
     }
     if (addr_known(&event->disc.addr)) {
@@ -487,9 +486,6 @@ static int disc_gap_event(struct ble_gap_event *event, void *arg)
         s_connect_pending = false;
         scan_if_needed();
     } else {
-        if (s_ordered) {
-            s_next_nn++;   /* 다음 순번으로 진행 */
-        }
         char addr_str[18];
         const uint8_t *a = event->disc.addr.val;
         snprintf(addr_str, sizeof(addr_str), "%02x:%02x:%02x:%02x:%02x:%02x",
