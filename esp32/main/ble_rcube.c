@@ -361,6 +361,7 @@ void ble_rcube_init(void)
         .agg_stop    = ble_multirole_stop_aggregator,
         .forward     = ble_multirole_forward,
         .forward_all = ble_multirole_broadcast,
+        .fix_order   = ble_multirole_fix_order,
     };
     rcube_cmd_init(&cmd_ops);
 
