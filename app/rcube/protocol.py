@@ -142,8 +142,9 @@ def build_set_led_solid(target_id: int, rgb, n: int = 3) -> bytes:
 
 
 # ---- SetNodeConfig(0xD3) 서브커맨드 (펌웨어 rcube_cmd.h와 일치) ----
+# ※ 0x02(FIX_ORDER)는 기획서 7.5 [새 방식]에서 폐기 — 노드ID 저장 여부가 곧 고정형
+#   판정이라 별도의 고정형 전환 명령이 없다(SET_NETCONF 저장이 그 역할을 한다).
 D3_SUB_SET_GROUP = 0x01   # payload=[0x01, group_id] : 그룹 저장 후 재부팅
-D3_SUB_FIX_ORDER = 0x02   # payload=[0x02]           : 순서고정(각 큐브가 순서를 노드ID로) + 재부팅
 D3_SUB_SET_NODE = 0x03    # payload=[0x03, node_id]  : 노드ID 저장 후 재부팅
 D3_SUB_SET_NETCONF = 0x04 # payload=[0x04, node_id, cmf, term_id] : 통신방식 세팅 저장(재부팅 X)
 D3_SUB_REBOOT = 0x05      # payload=[0x05]           : 재부팅(브로드캐스트=전체)
@@ -185,38 +186,43 @@ def build_reboot_all(*, target_id: int = ADDR_BROADCAST) -> bytes:
     return build_frame(target_id, OpCode.SetNodeConfig, bytes((D3_SUB_REBOOT,)))
 
 
-def build_fix_order(*, target_id: int = ADDR_HUB) -> bytes:
-    """SetNodeConfig/FIX_ORDER. 첫 큐브(아그리게이터, 0xFE)에 보낸다.
+def build_get_node_config(*, target_id: int = ADDR_HUB) -> bytes:
+    """GetNodeConfig(0xD4). 저장된 설정을 조회한다.
 
-    payload = [FIX_ORDER]. 아그리게이터는 자기=노드1로, 각 멤버는 자기 가상ID(연결
-    순서 색상)를 노드ID로 저장한 뒤 전 큐브가 재부팅한다.
+    회신 payload = [group_id, node_id, cmf, term_id]. 멤버(target=가상ID)에 보내면
+    BLE 허브가 중계하고, 멤버의 회신 notify를 허브가 PC로 되돌려 준다.
+    통신방식 세팅(7.2-2)이 각 큐브에 실제로 저장됐는지 확인하는 용도.
     """
-    return build_frame(target_id, OpCode.SetNodeConfig, bytes((D3_SUB_FIX_ORDER,)))
+    return build_frame(target_id, OpCode.GetNodeConfig, b"")
 
 
-# SetMultiroleAggregator flags (payload[2])
-AGG_FLAG_ORDERED = 0x01   # 멤버를 광고이름 NN 오름차순으로 연결(순서고정 연결)
+def build_reset_config(*, target_id: int = ADDR_BROADCAST) -> bytes:
+    """ResetConfig(0xD7). 공장 초기화(노드ID=0, CMF=BLE, 종단ID=0) 후 재부팅.
+
+    기획서 7.3 [노드ID/세팅 초기화 - 공통]. 노드ID=0이 되므로 비고정형으로 돌아간다.
+    기본 브로드캐스트(0xFF): 허브가 전 멤버로 중계한 뒤 자신도 초기화한다.
+    """
+    return build_frame(target_id, OpCode.ResetConfig, b"")
 
 
 def build_set_aggregator(
     connection_link_count: int,
     *,
     group_enabled: bool = False,
-    ordered: bool = False,
     virtual_ids=None,
     target_id: int = ADDR_HUB,
 ) -> bytes:
-    """SetMultiroleAggregator(0xA0). 이 큐브를 BLE 허브(아그리게이터)로 승격.
+    """SetMultiroleAggregator(0xA0). 이 큐브를 BLE 허브로 승격.
 
     payload = [ConnectionLinkCount][GroupMode][Flags] (+ 고정형이면 VirtualCubeId 4B×n)
-    - connection_link_count : 연결 대상 큐브 수(계약상 아그리게이터 포함 총 N)
-    - group_enabled=False   : GROUP_DISABLED(0x0A) 비고정형(그룹 무관)
-    - ordered=True          : AGG_FLAG_ORDERED — 멤버를 NN 순서대로 연결
-    - virtual_ids           : 고정형일 때만. 각 4바이트(big-endian).
+    - connection_link_count : 연결 대상 큐브 수(계약상 허브 포함 총 N)
+    - group_enabled=False   : GROUP_DISABLED(0x0A) 그룹 무관 연결
+
+    ※ 고정형/비고정형은 PC가 지시하지 않는다. 기획서 7.5 [새 방식]대로 허브 큐브가
+      자기 저장 노드ID 유무로 스스로 판정한다(Flags는 0으로 예약).
     """
     mode = GROUP_ENABLED if group_enabled else GROUP_DISABLED
-    flags = AGG_FLAG_ORDERED if ordered else 0x00
-    payload = bytearray((connection_link_count & 0xFF, mode, flags))
+    payload = bytearray((connection_link_count & 0xFF, mode, 0x00))
     if virtual_ids:
         for vid in virtual_ids:
             payload += int(vid).to_bytes(4, "big")
