@@ -196,6 +196,53 @@ def build_get_node_config(*, target_id: int = ADDR_HUB) -> bytes:
     return build_frame(target_id, OpCode.GetNodeConfig, b"")
 
 
+# ---- 멤버 맵 (기획서 7.3-3 ★보강) — 펌웨어 rcube_config.h와 일치 ----
+MAX_NODES = 8
+MEMBER_NONE = 0xFF   # 그 노드ID는 유닛에 없음
+MEMBER_BLE = 0x00
+MEMBER_CAN = 0x01
+
+
+def build_member_map(cmf_by_node: dict) -> bytes:
+    """{노드ID: CMF} → 8바이트 멤버 맵(인덱스 i = 노드ID i+1)."""
+    m = bytearray([MEMBER_NONE] * MAX_NODES)
+    for node_id, cmf in cmf_by_node.items():
+        nid = int(node_id)
+        if not 1 <= nid <= MAX_NODES:
+            raise ValueError(f"노드ID 범위(1~{MAX_NODES}) 초과: {nid}")
+        m[nid - 1] = MEMBER_CAN if int(cmf) else MEMBER_BLE
+    return bytes(m)
+
+
+def build_set_edge_central(ecf: int, unit_count: int, term_id: int, member_map: bytes,
+                           *, target_id: int = ADDR_HUB) -> bytes:
+    """SetEdgeCentralConfig(0xD5). 독립로봇유닛 전환/강등 (기획서 7.3-3).
+
+    payload = [ecf, unit_n, term_id, map[8]]
+    - ecf=1 : 이 큐브를 edge central(리드 큐브)로. 멤버 맵·N·종단노드ID를 함께 저장.
+    - ecf=0 : 강등(일반 큐브로 복귀). 멤버 맵도 삭제된다.
+    저장만 하고 재부팅하지 않는다 — 배선 정리를 위해 이어서 shutdown(E7)을 보낸다.
+    """
+    if len(member_map) != MAX_NODES:
+        raise ValueError(f"member_map은 {MAX_NODES}바이트여야 합니다: {len(member_map)}")
+    payload = bytes((ecf & 0xFF, unit_count & 0xFF, term_id & 0xFF)) + bytes(member_map)
+    return build_frame(target_id, OpCode.SetEdgeCentralConfig, payload)
+
+
+def build_get_edge_central(*, target_id: int = ADDR_HUB) -> bytes:
+    """GetEdgeCentralConfig(0xD6). 회신 payload = [ecf, unit_n, term_id, map[8]]."""
+    return build_frame(target_id, OpCode.GetEdgeCentralConfig, b"")
+
+
+def build_shutdown(*, target_id: int = ADDR_BROADCAST) -> bytes:
+    """SetPowerState(0xE7) payload=[0] = shut down. 기획서 7.3-4.
+
+    기본 브로드캐스트: 허브가 전 멤버로 중계한 뒤 자신도 끈다. 개발보드에는 전원 차단
+    회로가 없어 펌웨어가 딥슬립으로 대신하며, BOOT 버튼으로 다시 깨어난다.
+    """
+    return build_frame(target_id, OpCode.SetPowerState, bytes((0x00,)))
+
+
 def build_reset_config(*, target_id: int = ADDR_BROADCAST) -> bytes:
     """ResetConfig(0xD7). 공장 초기화(노드ID=0, CMF=BLE, 종단ID=0) 후 재부팅.
 

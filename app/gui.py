@@ -40,6 +40,13 @@ from rcube import (
     build_set_group,
     build_get_node_config,
     build_reset_config,
+    build_member_map,
+    build_set_edge_central,
+    build_get_edge_central,
+    build_shutdown,
+    MAX_NODES,
+    MEMBER_NONE,
+    MEMBER_CAN,
     build_set_netconf,
     build_reboot_all,
     parse_frame,
@@ -200,9 +207,16 @@ class RCubeApp:
         self.net_hint = ttk.Label(self.net_rows,
                                   text="R1~R4로 큐브를 모두 연결하면 여기에 큐브별 통신방식 선택이 나타납니다.")
         self.net_hint.grid(row=0, column=0, sticky="w")
+        netright = ttk.Frame(netf)
+        netright.pack(side="right", padx=8, pady=4)
+        # 기획서 7.3-1: 체크하면 통신방식 세팅과 함께 리드 큐브(노드01)를 edge central로
+        # 만든다(ECF=1 + 멤버 맵 + N 저장). 미션코드 업로드는 8장에서 붙인다.
+        self.edge_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(netright, text="고정로봇유닛(독립)",
+                        variable=self.edge_var, command=self._paint_net_save).pack(anchor="e")
         self.net_save_btn = tk.Button(netf, text="저장(재부팅)", command=self.on_save_netconf,
                                       state="disabled")
-        self.net_save_btn.pack(side="right", padx=8, pady=4)
+        self.net_save_btn.pack(side="right", padx=4, pady=4)
 
         # 3b) 큐브 설정 도구 (조회 / 초기화)
         # 두 명령 모두 "허브 + 전 멤버"를 대상으로 하므로, R1~R4로 유닛이 완전히 구성된
@@ -211,10 +225,12 @@ class RCubeApp:
         self.toolf.pack(fill="x", **pad)
         self.tool_btns = [
             ttk.Button(self.toolf, text="설정 조회", command=self.on_get_config),
+            ttk.Button(self.toolf, text="독립 해제(강등)", command=self.on_demote_edge),
             ttk.Button(self.toolf, text="공장 초기화", command=self.on_reset_config),
         ]
         self.tool_desc = ttk.Label(
-            self.toolf, text="조회=각 큐브의 저장 노드ID/통신방식 확인 · 초기화=비고정형으로 복귀")
+            self.toolf, text="조회=저장 설정 확인 · 강등=ECF 해제(설정모드로 연결한 큐브에) · "
+                             "초기화=비고정형으로 복귀")
         self.tool_hint = ttk.Label(
             self.toolf, text="R1~R4로 큐브가 모두 연결되면 설정 조회·공장 초기화를 쓸 수 있습니다.")
         self._paint_tools()
@@ -291,6 +307,14 @@ class RCubeApp:
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
+
+    # ---- 네트워크 저장 버튼 문구 ----
+    def _paint_net_save(self) -> None:
+        """독립 전환 여부에 따라 저장 버튼이 무엇을 하는지 문구로 드러낸다."""
+        if not hasattr(self, "net_save_btn"):
+            return
+        self.net_save_btn.configure(
+            text="저장(전원끄기)" if self.edge_var.get() else "저장(재부팅)")
 
     # ---- 큐브 설정 도구 노출 ----
     def _tools_ready(self) -> bool:
@@ -601,6 +625,16 @@ class RCubeApp:
             self._log(f"    └ [설정] {who}: 그룹={g} 노드ID={node}({kind}) "
                       f"통신={'CAN' if cmf else 'BLE'} 종단노드={term}", "scn")
             return
+        if fr.op_code == int(OpCode.GetEdgeCentralConfig) and len(fr.payload) >= 3 + MAX_NODES:
+            ecf, unit_n, term = fr.payload[0], fr.payload[1], fr.payload[2]
+            rows = []
+            for i in range(MAX_NODES):
+                v = fr.payload[3 + i]
+                if v != MEMBER_NONE:
+                    rows.append(f"{i + 1}:{'CAN' if v == MEMBER_CAN else 'BLE'}")
+            self._log(f"    └ [독립] ECF={ecf}({'edge central' if ecf else '일반'}) "
+                      f"유닛 {unit_n}대 종단노드={term} 멤버맵 [{', '.join(rows) or '없음'}]", "scn")
+            return
         if fr.op_code == OP_AGGREGATOR_EVENT and self.active is not None:
             self._on_aggregator_event(fr)
 
@@ -685,6 +719,28 @@ class RCubeApp:
         for vid in vids:
             self._run(self.ble.send(build_get_node_config(target_id=vid)))
 
+    def on_demote_edge(self) -> None:
+        """독립 해제(강등) — ECF=0 + 멤버 맵 삭제 (기획서 7.3 [독립→일반 되돌리기]).
+
+        edge central은 연결모드에서 곧바로 central이 되어 PC에 붙지 않으므로, 되돌릴
+        큐브는 설정모드(버튼 3초 롱프레스, RCUBECONFIG 광고)로 진입시켜 연결한 뒤 누른다.
+        노드ID·통신방식은 유지된다(완전 초기화는 '공장 초기화').
+        """
+        if not self.ble.is_connected:
+            self._log("[강등] 연결이 없습니다.", "err")
+            return
+        if not messagebox.askyesno(
+                "독립 해제(강등)",
+                "연결된 큐브의 ECF를 해제하고 멤버 맵을 삭제해 일반 큐브로 되돌립니다.\n"
+                "노드ID·통신방식(CMF)은 그대로 유지됩니다.\n\n"
+                "※ edge central은 설정모드(버튼 3초 롱프레스)로 연결한 상태여야 합니다.\n\n"
+                "진행할까요?"):
+            return
+        self._log("[강등] SetEdgeCentralConfig(ECF=0) 전송 → 멤버 맵 삭제", "scn")
+        empty = build_member_map({})
+        self._run(self.ble.send(build_set_edge_central(0, 0, 0, empty, target_id=ADDR_HUB)))
+        self._run(self.ble.send(build_get_edge_central(target_id=ADDR_HUB)))
+
     def on_reset_config(self) -> None:
         """공장 초기화(ResetConfig 0xD7) — 노드ID=0, CMF=BLE로 되돌리고 전체 재부팅."""
         if not self.ble.is_connected:
@@ -717,10 +773,27 @@ class RCubeApp:
                 can_vids.append(vid)
         term = max(can_vids) if can_vids else 0
         desc = ", ".join(f"{vid}:{'CAN' if choices[vid] else 'BLE'}" for vid in range(1, n + 1))
+        edge = bool(self.edge_var.get())
+
+        if edge and not messagebox.askyesno(
+                "고정로봇유닛(독립) 전환",
+                f"노드01을 edge central(리드 큐브)로 만들고 멤버 맵을 저장합니다.\n\n"
+                f"구성: [{desc}] · 종단노드 {term}\n\n"
+                "저장 후 모든 큐브가 꺼집니다. 배선을 독립유닛 형태로 정리한 뒤\n"
+                "(PC-리드 큐브 CAN 케이블 제거, 큐브끼리 노드ID 오름차순 연결)\n"
+                "버튼으로 다시 켜면 리드 큐브가 스스로 멤버를 연결합니다.\n\n"
+                "진행할까요?"):
+            return
+
         # 기획서 7.2 step3: PC가 nodeID→CMF 매핑 테이블을 자기 메모리에 저장(고정형 재연결 근거).
+        # 7.3에서는 이 표가 곧 edge central에 저장할 "멤버 맵"의 원본이다.
         self._save_netmap(n, choices, term)
-        self._log(f"[네트워크] 저장 [{desc}] 종단노드={term} → 각 큐브 저장 후 전체 재부팅(연결 끊김)", "scn")
-        self._run(self._save_netconf_coro(n, choices, term))
+        if edge:
+            self._log(f"[독립] 저장 [{desc}] 종단노드={term} → 노드01에 ECF=1·멤버맵 저장 후 "
+                      f"전체 전원끄기(7.3)", "scn")
+        else:
+            self._log(f"[네트워크] 저장 [{desc}] 종단노드={term} → 각 큐브 저장 후 전체 재부팅(연결 끊김)", "scn")
+        self._run(self._save_netconf_coro(n, choices, term, edge))
 
     def _save_netmap(self, n: int, choices: dict, term: int) -> None:
         try:
@@ -761,14 +834,31 @@ class RCubeApp:
             self.ui_q.put(("log", msg))
         threading.Thread(target=work, daemon=True).start()
 
-    async def _save_netconf_coro(self, n: int, choices: dict, term: int) -> None:
-        # 1) 각 큐브에 통신방식 세팅 저장(재부팅 없이). vid1=아그리게이터(0xFE), 그 외=멤버 중계.
+    async def _save_netconf_coro(self, n: int, choices: dict, term: int, edge: bool) -> None:
+        # 1) 각 큐브에 통신방식 세팅 저장(재부팅 없이). vid1=허브(0xFE), 그 외=멤버 중계.
+        #    노드ID가 함께 저장되므로 이 시점에 고정형이 된다(기획서 7.5).
         for vid in range(1, n + 1):
             target = ADDR_HUB if vid == 1 else vid
             await self.ble.send(build_set_netconf(vid, choices[vid], term, target_id=target))
         await asyncio.sleep(0.2)
-        # 2) 전체 재부팅(브로드캐스트).
-        await self.ble.send(build_reboot_all())
+
+        if not edge:
+            # 7.2-4: 저장이 끝나면 전체 재부팅. 다음 부팅부터 고정형으로 재연결한다.
+            await self.ble.send(build_reboot_all())
+            return
+
+        # 7.3-3: 리드 큐브(노드01)에 ECF=1 + 전체 큐브 수 + 멤버 맵 + 종단노드ID를 저장.
+        # (미션코드 업로드 F0~F2는 8장 확정 후 이 앞 단계에 들어간다.)
+        member_map = build_member_map(choices)
+        await self.ble.send(build_set_edge_central(1, n, term, member_map, target_id=ADDR_HUB))
+        await asyncio.sleep(0.3)
+        # 저장 확인(D6 회신은 로그에 해석되어 찍힌다).
+        await self.ble.send(build_get_edge_central(target_id=ADDR_HUB))
+        await asyncio.sleep(0.3)
+        # 7.3-4: 모든 큐브에 shut down. 배선을 독립유닛 형태로 정리한 뒤 다시 켠다.
+        await self.ble.send(build_shutdown())
+        self.ui_q.put(("log", "[독립] 전원끄기 전송 — 배선 정리 후 리드 큐브부터 켜세요. "
+                              "리드 큐브가 스스로 멤버를 연결합니다(7.4)."))
 
     def _debug_frame(self):
         """디버그 입력(Target/OpCode/payload)에서 표준 프레임을 만든다. 실패 시 None."""
