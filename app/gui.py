@@ -45,7 +45,6 @@ from rcube import (
     ADDR_HUB,
     ADDR_BROADCAST,
     RED,
-    GREEN,
     OP_AGGREGATOR_EVENT,
 )
 
@@ -86,11 +85,12 @@ def _parse_nn(name: str):
 # 큐브 가상ID(연결순서) → 노드ID 색 이름 (기획서 RGBCMYVO)
 CUBE_COLORS = {1: "Red", 2: "Green", 3: "Blue", 4: "Cyan"}
 
-# 노드ID(1~8) → RGB (기획서 RGBCMYVO). CAN 색 확인 명령용.
+# 노드ID(1~8) → RGB (기획서 RGBCMYVO). 펌웨어 rcube_status.c PALETTE와 동일해야 한다.
 NODE_RGB = {
     1: (255, 0, 0), 2: (0, 255, 0), 3: (0, 0, 255), 4: (0, 255, 255),
     5: (255, 0, 255), 6: (255, 255, 0), 7: (148, 0, 211), 8: (255, 90, 0),
 }
+WHITE = (255, 255, 255)   # 노드ID 범위 밖(미할당 등) 대체색
 
 
 BTN_IDLE = {"bg": "#b8b8b8", "fg": "#000000", "activebackground": "#a8a8a8"}
@@ -410,16 +410,22 @@ class RCubeApp:
         cur = max(self.scn_members, min(cur, self.scn_total - 1))
         if cur <= self.scn_members:
             return
-        # 새로 붙은 멤버(인덱스 prev+1..cur) 각각에 초록 LED.
+        # 새로 붙은 멤버(인덱스 prev+1..cur) 각각에 자기 노드ID 색 LED.
         # 가상노드ID: 아그리게이터=1, 멤버 k → ID (k+1) = 2..N
         for member_idx in range(self.scn_members + 1, cur + 1):
             vid = member_idx + 1
-            self._log(f"[scn] 멤버{member_idx} 연결(가상ID {vid}) → 초록 LED", "scn")
-            self._run(self.ble.send(build_set_led_solid(vid, GREEN)))
+            self._log(f"[scn] 멤버{member_idx} 연결(가상ID {vid}) → {CUBE_COLORS.get(vid, vid)} LED", "scn")
+            self._run(self.ble.send(build_set_led_solid(vid, NODE_RGB.get(vid, WHITE))))
         self.scn_members = cur
         if self.scn_members >= self.scn_total - 1:
             self.scn_done = True
             self._paint_buttons()
+            # 순서고정은 가상ID=광고 노드ID라 연결 순서와 무관하다(펌웨어 ble_multirole).
+            # 위 증분 루프는 연결 순서를 가정하므로, 전원 연결된 시점에 색을 다시 확정한다.
+            if self.scn_ordered:
+                for vid in range(2, self.scn_total + 1):
+                    self._run(self.ble.send(build_set_led_solid(vid, NODE_RGB.get(vid, WHITE))))
+                self._log("[scn] 순서고정 — 노드ID 색 재확정", "scn")
             self._log(f"[R{self.active}] 완료 — 총 {self.scn_total}대 연결", "scn")
 
     # =====================================================================
