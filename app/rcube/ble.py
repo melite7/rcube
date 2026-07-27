@@ -17,6 +17,9 @@ from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 
 RCUBE_NAME_PREFIX = "RCUBE"
+# 연결 대상 이름 접두어: 일반(비고정형/고정형) + 설정모드. 둘 다 스캔·연결한다.
+#   RCUBEROBOT.GG.NN = 일반 동작,  RCUBECONFIG.GG.NN = 설정모드 진입 큐브.
+RCUBE_NAME_PREFIXES = ("RCUBEROBOT", "RCUBECONFIG")
 
 RCUBE_SVC_UUID = "52434245-0000-1000-8000-00805f9b34fb"
 RCUBE_CHR_UUID = "52434245-0001-1000-8000-00805f9b34fb"
@@ -77,13 +80,16 @@ class RCubeBLE:
 
     # ---- 스캔 ----
     @staticmethod
-    async def scan(timeout: float = 5.0, prefix: str = RCUBE_NAME_PREFIX) -> list[ScanResult]:
-        """주변을 스캔해 이름이 prefix 로 시작하는 기기 목록을 돌려준다."""
+    async def scan(timeout: float = 5.0, prefix=RCUBE_NAME_PREFIXES) -> list[ScanResult]:
+        """주변을 스캔해 이름이 prefix(문자열 또는 튜플)로 시작하는 기기 목록을 돌려준다.
+
+        기본값=RCUBE_NAME_PREFIXES → RCUBEROBOT(일반) + RCUBECONFIG(설정모드) 모두 포함.
+        """
         found: dict[str, ScanResult] = {}
         devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
         for _, (dev, adv) in devices.items():  # {address: (BLEDevice, AdvertisementData)}
             name = adv.local_name or dev.name or ""
-            if name.startswith(prefix):
+            if name.startswith(prefix):   # str.startswith 는 튜플도 허용
                 found[dev.address] = ScanResult(
                     name=name, address=dev.address, rssi=adv.rssi
                 )
