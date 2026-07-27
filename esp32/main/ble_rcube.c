@@ -3,6 +3,7 @@
 #include "rcube_cmd.h"
 #include "ble_multirole.h"
 #include "rcube_config.h"
+#include "rcube_status.h"
 
 #include <stdio.h>
 
@@ -23,15 +24,19 @@
 
 static const char *TAG = "ble";
 
-/* 광고 이름 규칙: "RCUBEROBOT.GG.NN" (GG=그룹번호, NN=노드ID, 각 10진 2자리).
- * 상위(PC/허브)는 NN을 보고 노드ID 순서대로 연결할 수 있다. 접두어 "RCUBE" 유지. */
-#define RCUBE_NAME_PREFIX "RCUBEROBOT"
+/* 광고 이름: 일반 "RCUBEROBOT.GG.NN", 설정모드 "RCUBECONFIG.GG.NN".
+ * (GG=그룹번호, NN=노드ID 각 10진 2자리). 둘 다 접두어 "RCUBE" 공유. */
+#define RCUBE_NAME_ROBOT  "RCUBEROBOT"
+#define RCUBE_NAME_CONFIG "RCUBECONFIG"
 
-/* 현재 설정(group/node)으로 광고 이름을 만들어 GAP 장치이름에 설정한다. */
+static bool s_config_name;   /* 설정모드 광고 이름(RCUBECONFIG) 사용 여부 */
+
+/* 현재 설정(group/node/모드)으로 광고 이름을 만들어 GAP 장치이름에 설정한다. */
 static void update_device_name(void)
 {
-    char name[32];
-    snprintf(name, sizeof(name), "%s.%02u.%02u", RCUBE_NAME_PREFIX,
+    char name[40];
+    snprintf(name, sizeof(name), "%s.%02u.%02u",
+             s_config_name ? RCUBE_NAME_CONFIG : RCUBE_NAME_ROBOT,
              rcube_config_group_id(), rcube_config_node_id());
     ble_svc_gap_device_name_set(name);
 }
@@ -202,7 +207,10 @@ static void adv_start(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_advertising = true;
     xSemaphoreGive(s_lock);
-    board_led_set_node(LED_ADV_R, LED_ADV_G, LED_ADV_B);
+    /* 설정모드에선 노드LED가 흰색 점멸 중이므로 광고색(cyan)으로 덮지 않는다. */
+    if (!rcube_status_in_config_mode()) {
+        board_led_set_node(LED_ADV_R, LED_ADV_G, LED_ADV_B);
+    }
     ESP_LOGI(TAG, "advertising as \"%s\" (connectable)", name);
 }
 
@@ -231,6 +239,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_advertising = false;
             s_conn_handle = event->connect.conn_handle;
             xSemaphoreGive(s_lock);
+            rcube_status_on_connected();   /* 노드LED 소유권 이전(상위 지정색 표시) */
             board_led_set_node(LED_CONN_R, LED_CONN_G, LED_CONN_B);
             ESP_LOGI(TAG, "connected (handle=%d)", event->connect.conn_handle);
         } else {
@@ -251,7 +260,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         xSemaphoreGive(s_lock);
         /* PC 연결이 끊기면 아그리게이터 역할도 해제(멤버 전원 종료). */
         ble_multirole_stop_aggregator();
-        board_led_set_node(LED_IDLE_R, LED_IDLE_G, LED_IDLE_B);
+        rcube_status_on_disconnected();   /* 설정모드였다면 흰색 점멸 재개 */
+        if (!rcube_status_in_config_mode()) {
+            board_led_set_node(LED_IDLE_R, LED_IDLE_G, LED_IDLE_B);
+        }
         try_advertise();   /* 재연결을 위해 광고 재개 */
         return 0;
 
@@ -359,9 +371,27 @@ void ble_rcube_init(void)
 
 void ble_rcube_start_advertising(void)
 {
+    s_config_name = false;   /* 일반 이름(RCUBEROBOT) */
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_start_requested = true;
     xSemaphoreGive(s_lock);
+    try_advertise();
+}
+
+void ble_rcube_start_config_advertising(void)
+{
+    s_config_name = true;    /* 설정모드 이름(RCUBECONFIG) */
+    bool restart;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_start_requested = true;
+    restart = s_advertising;   /* 이미 광고 중이면 이름 바꾸려 재시작 */
+    xSemaphoreGive(s_lock);
+    if (restart) {
+        ble_gap_adv_stop();
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_advertising = false;
+        xSemaphoreGive(s_lock);
+    }
     try_advertise();
 }
 

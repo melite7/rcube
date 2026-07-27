@@ -73,7 +73,14 @@ static void imu_task(void *arg)
     }
 }
 
-/* BOOT 버튼 감시: 눌림(하강 에지)을 디바운스로 감지해 BLE 광고를 시작한다. */
+/* 설정모드 진입 롱프레스 임계(기획서 0724: 대기모드 3초). */
+#define CONFIG_HOLD_MS 3000
+
+/* BOOT 버튼 감시:
+ *   - 짧게 누름(<3s) : 연결모드(광고 RCUBEROBOT) + 버튼음.
+ *   - 길게 누름(≥3s): 설정모드 진입 — 노드LED 흰색 0.25s 점멸 + 광고 RCUBECONFIG.
+ *     임계 도달 순간(누른 채) LED가 바뀌어 사용자가 놓을 시점을 안다. 놓아도 유지.
+ * (개발보드 GPIO0 버튼 기준. 메인보드는 STM6601 IO48/IO2로 동일 로직.) */
 static void button_task(void *arg)
 {
     gpio_config_t io = {
@@ -92,19 +99,29 @@ static void button_task(void *arg)
         if (prev == 1 && level == 0) {          /* 하강 에지 = 눌림 시작 */
             vTaskDelay(pdMS_TO_TICKS(20));       /* 디바운스 */
             if (gpio_get_level(BOOT_BTN_GPIO) == 0) {
-                /* 버튼음은 누를 때마다 재생. */
                 rcube_buzzer_play(RCUBE_MELODY_BUTTON_PRESSED);
-                /* 최초 눌림 = 연결모드 진입(아이덴티티 표시 중지 + 광고 시작). */
-                bool first = rcube_status_enter_connect_mode();
-                if (first) {
-                    ESP_LOGI(TAG, "BOOT pressed -> connect mode: start BLE advertising");
-                    ble_rcube_start_advertising();
-                } else {
-                    ESP_LOGI(TAG, "BOOT pressed (already in connect mode)");
-                }
-                /* 눌린 동안 대기(연속 트리거 방지) */
+                /* 누른 채 hold 시간 측정. 3초 도달 순간 설정모드로 전환. */
+                uint32_t held = 0;
+                bool config_triggered = false;
                 while (gpio_get_level(BOOT_BTN_GPIO) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(20));
+                    held += 20;
+                    if (!config_triggered && held >= CONFIG_HOLD_MS) {
+                        config_triggered = true;
+                        ESP_LOGI(TAG, "BOOT held >=3s -> config mode (RCUBECONFIG)");
+                        rcube_status_enter_config_mode();
+                        ble_rcube_start_config_advertising();
+                    }
+                }
+                /* 놓음. 짧게였으면 연결모드 진입. */
+                if (!config_triggered) {
+                    bool first = rcube_status_enter_connect_mode();
+                    if (first) {
+                        ESP_LOGI(TAG, "BOOT short press -> connect mode: start advertising");
+                        ble_rcube_start_advertising();
+                    } else {
+                        ESP_LOGI(TAG, "BOOT short press (already in connect/config)");
+                    }
                 }
             }
         }
