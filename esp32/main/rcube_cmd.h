@@ -19,6 +19,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* 완성된 와이어 프레임을 PC로 회신(notify). 성공 시 0. */
@@ -56,3 +57,12 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len);
 
 /* 아그리게이터의 현재 멤버 수를 PC에 0xA1로 보고한다. (멀티롤 레이어가 호출) */
 void rcube_cmd_report_members(uint8_t members_connected);
+
+/* 완성된 와이어 프레임을 현재 전송계층(BLE notify 또는 CAN)으로 내보낸다.
+ * 센서 스트림처럼 명령 수신 없이 스스로 올리는 상위 모듈이 쓴다. */
+int rcube_cmd_send_frame(const uint8_t *frame, uint16_t len);
+
+/* 자신 + 연결된 전 BLE 멤버에 센서 전송 시작/중지를 지시한다(기획서 9장).
+ * 유닛 구성이 끝난 시점에 edge central이 호출한다. 지시한 멤버 수를 반환.
+ * (CAN 분기는 can_transport가 자기 완료 시점에 CAN 브로드캐스트로 따로 지시한다.) */
+int rcube_cmd_sensor_stream_all(bool on, uint16_t period_ms);

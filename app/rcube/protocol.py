@@ -196,6 +196,46 @@ def build_get_node_config(*, target_id: int = ADDR_HUB) -> bytes:
     return build_frame(target_id, OpCode.GetNodeConfig, b"")
 
 
+# ---- 센서 모니터링 (기획서 9장) — 펌웨어 rcube_sensor.h와 일치 ----
+SENSOR_KIND_ACCEL = 0x00   # 가속도, 단위 mg
+SENSOR_KIND_GYRO = 0x01    # 자이로, 단위 0.1°/s
+SENSOR_PERIOD_DEFAULT_MS = 200
+
+
+def build_get_sensors(*, target_id: int = ADDR_HUB) -> bytes:
+    """GetSensors(0xB0). 지금 1회만 센서를 올리게 한다.
+
+    회신 payload = [kind][x][y][z] (int16 big-endian ×3, 총 7B). 가속도·자이로
+    2프레임으로 나뉘어 온다. 7바이트인 이유는 CAN 데이터필드(8B)에 멀티프레임 없이
+    들어가야 하기 때문이다.
+    """
+    return build_frame(target_id, OpCode.GetSensors, b"")
+
+
+def build_set_sensor_stream(on: bool, period_ms: int = SENSOR_PERIOD_DEFAULT_MS,
+                            *, target_id: int = ADDR_BROADCAST) -> bytes:
+    """SetSensorStream(0xB1). 주기 전송 시작/중지 (기획서 9장 "센서 전송 시작 명령").
+
+    payload = [on, period_hi, period_lo]. 기본 브로드캐스트(0xFF): BLE 허브가 전
+    멤버로 중계한 뒤 자신도 적용한다 — 허브도 유닛의 한 큐브이므로 자기 센서를 함께 올린다.
+    """
+    return build_frame(target_id, OpCode.SetSensorStream,
+                       bytes((1 if on else 0, (period_ms >> 8) & 0xFF, period_ms & 0xFF)))
+
+
+def parse_sensor_payload(payload: bytes):
+    """센서 payload(7B)를 (kind, x, y, z)로. 형식이 아니면 None."""
+    if len(payload) < 7:
+        return None
+    kind = payload[0]
+
+    def i16(hi, lo):
+        v = (hi << 8) | lo
+        return v - 0x10000 if v & 0x8000 else v
+
+    return kind, i16(payload[1], payload[2]), i16(payload[3], payload[4]), i16(payload[5], payload[6])
+
+
 # ---- 멤버 맵 (기획서 7.3-3 ★보강) — 펌웨어 rcube_config.h와 일치 ----
 MAX_NODES = 8
 MEMBER_NONE = 0xFF   # 그 노드ID는 유닛에 없음

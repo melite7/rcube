@@ -44,6 +44,12 @@ from rcube import (
     build_set_edge_central,
     build_get_edge_central,
     build_shutdown,
+    build_get_sensors,
+    build_set_sensor_stream,
+    parse_sensor_payload,
+    SENSOR_KIND_ACCEL,
+    SENSOR_KIND_GYRO,
+    SENSOR_PERIOD_DEFAULT_MS,
     MAX_NODES,
     MEMBER_NONE,
     MEMBER_CAN,
@@ -235,6 +241,28 @@ class RCubeApp:
             self.toolf, text="R1~R4로 큐브가 모두 연결되면 설정 조회·공장 초기화를 쓸 수 있습니다.")
         self._paint_tools()
 
+        # 3c) 센서 모니터링 (기획서 9장)
+        # 유닛이 완전히 구성된 뒤에만 의미가 있으므로 설정 도구와 같은 조건으로 노출한다.
+        self.sensf = ttk.LabelFrame(self.root, text="센서 모니터링 (기획서 9장)")
+        self.sensf.pack(fill="x", **pad)
+        self.sens_bar = ttk.Frame(self.sensf)
+        self.sens_start = ttk.Button(self.sens_bar, text="전송 시작",
+                                     command=lambda: self.on_sensor_stream(True))
+        self.sens_stop = ttk.Button(self.sens_bar, text="중지",
+                                    command=lambda: self.on_sensor_stream(False))
+        self.sens_once = ttk.Button(self.sens_bar, text="1회 조회", command=self.on_sensor_once)
+        self.sens_period_var = tk.StringVar(value=str(SENSOR_PERIOD_DEFAULT_MS))
+        self.sens_start.pack(side="left", padx=(8, 4), pady=4)
+        self.sens_stop.pack(side="left", padx=4, pady=4)
+        self.sens_once.pack(side="left", padx=4, pady=4)
+        ttk.Label(self.sens_bar, text="주기(ms)").pack(side="left", padx=(12, 4))
+        ttk.Entry(self.sens_bar, textvariable=self.sens_period_var, width=6).pack(side="left")
+        self.sens_rows = ttk.Frame(self.sensf)
+        self.sens_labels: dict[int, tk.StringVar] = {}
+        self.sens_hint = ttk.Label(
+            self.sensf, text="R1~R4로 큐브가 모두 연결되면 센서 전송을 시작할 수 있습니다.")
+        self._paint_sensors()
+
         # 4) 로그
         logf = ttk.LabelFrame(self.root, text="로그")
         logf.pack(fill="both", expand=True, **pad)
@@ -332,6 +360,41 @@ class RCubeApp:
         else:
             self.tool_hint.pack(side="left", padx=8, pady=4)
 
+    # ---- 센서 모니터링 노출/행 구성 ----
+    def _unit_nodes(self) -> list:
+        """현재 유닛을 이루는 큐브의 주소 목록(허브 포함). 표시·조회 대상."""
+        if not self.active:
+            return []
+        if self.scn_fixed:
+            return list(self.scn_ble_nodes)
+        return list(range(1, self.scn_total + 1))
+
+    def _paint_sensors(self) -> None:
+        ready = self._tools_ready()
+        for w in (self.sens_bar, self.sens_rows, self.sens_hint):
+            w.pack_forget()
+        if not ready:
+            self.sens_labels.clear()
+            for w in self.sens_rows.winfo_children():
+                w.destroy()
+            self.sens_hint.pack(side="left", padx=8, pady=4)
+            return
+        self.sens_bar.pack(fill="x")
+        nodes = self._unit_nodes()
+        if set(nodes) != set(self.sens_labels.keys()):
+            self.sens_labels.clear()
+            for w in self.sens_rows.winfo_children():
+                w.destroy()
+            for i, nid in enumerate(nodes):
+                label = "허브" if (not self.scn_fixed and nid == 1) else f"노드 {nid}"
+                ttk.Label(self.sens_rows, text=f"{label} ({CUBE_COLORS.get(nid, nid)})",
+                          width=16).grid(row=i, column=0, sticky="w", padx=(8, 6), pady=1)
+                var = tk.StringVar(value="—")
+                ttk.Label(self.sens_rows, textvariable=var,
+                          font=("Consolas", 9)).grid(row=i, column=1, sticky="w")
+                self.sens_labels[nid] = var
+        self.sens_rows.pack(fill="x", pady=(0, 4))
+
     # ---- 연결 방식 안내문 ----
     def _paint_mode_hint(self) -> None:
         """선택한 연결 방식에 맞는 안내문. 고정형이면 저장된 매핑 구성을 보여준다."""
@@ -371,8 +434,9 @@ class RCubeApp:
                 b.configure(text=f"R{n}")
         # 네트워크 설정 UI: 시나리오 완료 시 큐브 수만큼 행 표시.
         self._set_net_ui(self.scn_total if (self.active is not None and self.scn_done) else 0)
-        # 설정 조회·공장 초기화: 유닛 구성이 끝난 뒤에만 노출.
+        # 설정 조회·공장 초기화·센서 모니터링: 유닛 구성이 끝난 뒤에만 노출.
         self._paint_tools()
+        self._paint_sensors()
 
     def _set_net_ui(self, n: int) -> None:
         """네트워크 설정 UI를 큐브 n개로 구성(0이면 안내문만). 안정 상태면 재구성 안 함."""
@@ -616,6 +680,10 @@ class RCubeApp:
             fr = parse_frame(raw)
         except Exception:
             return
+        if fr.op_code == int(OpCode.GetSensors):
+            # 센서 프레임은 주기적으로 쏟아지므로 로그를 채우지 않고 표에만 반영한다.
+            self._on_sensor_frame(fr)
+            return
         self._log(f"    └ {fr}", "rx")
         if fr.op_code == int(OpCode.GetNodeConfig) and len(fr.payload) >= 4:
             # [group, node, cmf, term] — target은 허브가 재기입한 발신 큐브 가상ID.
@@ -718,6 +786,58 @@ class RCubeApp:
         self._run(self.ble.send(build_get_node_config(target_id=ADDR_HUB)))
         for vid in vids:
             self._run(self.ble.send(build_get_node_config(target_id=vid)))
+
+    # ---- 센서 모니터링 (기획서 9장) ----
+    def on_sensor_stream(self, on: bool) -> None:
+        """센서 전송 시작/중지. 브로드캐스트라 허브가 전 멤버로 중계한 뒤 자신도 적용한다."""
+        if not self.ble.is_connected:
+            self._log("[센서] 연결이 없습니다.", "err")
+            return
+        try:
+            period = int(self.sens_period_var.get())
+        except ValueError:
+            self._log("[센서] 주기는 정수(ms)여야 합니다.", "err")
+            return
+        if on and not 20 <= period <= 10000:
+            self._log("[센서] 주기는 20~10000 ms 범위여야 합니다.", "err")
+            return
+        self._log(f"[센서] 전송 {'시작' if on else '중지'} (주기 {period} ms) → 브로드캐스트", "scn")
+        self._run(self.ble.send(build_set_sensor_stream(on, period)))
+
+    def on_sensor_once(self) -> None:
+        """유닛의 각 큐브에 1회 조회(GetSensors)."""
+        if not self.ble.is_connected:
+            self._log("[센서] 연결이 없습니다.", "err")
+            return
+        nodes = self._unit_nodes()
+        self._log(f"[센서] 1회 조회 → 허브 + 멤버 {max(0, len(nodes) - 1)}대", "scn")
+        self._run(self.ble.send(build_get_sensors(target_id=ADDR_HUB)))
+        for nid in nodes[1:]:
+            self._run(self.ble.send(build_get_sensors(target_id=nid)))
+
+    def _on_sensor_frame(self, fr) -> None:
+        """센서 프레임 수신 → 해당 노드 행 갱신. target은 발신 큐브(허브가 재기입)."""
+        parsed = parse_sensor_payload(fr.payload)
+        if parsed is None:
+            return
+        kind, x, y, z = parsed
+        # 허브 자신이 보낸 프레임은 target=0xFE로 온다 → 유닛의 첫 큐브로 매핑.
+        nodes = self._unit_nodes()
+        nid = fr.target_id
+        if nid == ADDR_HUB and nodes:
+            nid = nodes[0]
+        var = self.sens_labels.get(nid)
+        if var is None:
+            return
+        prev = var.get()
+        acc, gyr = "", ""
+        if " | " in prev:
+            acc, gyr = prev.split(" | ", 1)
+        if kind == SENSOR_KIND_ACCEL:
+            acc = f"acc {x:6d},{y:6d},{z:6d} mg"
+        elif kind == SENSOR_KIND_GYRO:
+            gyr = f"gyro {x / 10:7.1f},{y / 10:7.1f},{z / 10:7.1f} °/s"
+        var.set(f"{acc or 'acc —':<28} | {gyr or 'gyro —'}")
 
     def on_demote_edge(self) -> None:
         """독립 해제(강등) — ECF=0 + 멤버 맵 삭제 (기획서 7.3 [독립→일반 되돌리기]).

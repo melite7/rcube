@@ -3,6 +3,7 @@
 #include "rcube_config.h"
 #include "rcube_status.h"
 #include "rcube_buzzer.h"
+#include "rcube_sensor.h"
 
 #include <string.h>
 
@@ -64,6 +65,12 @@ static void edge_note_member(uint8_t node_id)
     if (s_edge_found >= s_edge_expected) {
         ESP_LOGI(TAG, "edge central: CAN 멤버 전원 발견(%u대)", s_edge_expected);
         rcube_buzzer_play(RCUBE_MELODY_LINK_COMPLETED);
+        /* 기획서 9장 [독립로봇유닛]: CAN 분기에도 센서 전송 시작을 지시한다.
+         * (BLE 분기는 ble_multirole이 자기 완료 시점에 따로 지시한다.) */
+        uint16_t period = RCUBE_SENSOR_PERIOD_DEFAULT_MS;
+        uint8_t p[3] = {1, (uint8_t)(period >> 8), (uint8_t)(period & 0xFF)};
+        can_transport_send(RCUBE_PRI_CONFIG, RCUBE_OP_SetSensorStream,
+                           RCUBE_ADDR_BROADCAST, p, sizeof(p));
     } else {
         rcube_buzzer_play(RCUBE_MELODY_LINK);
     }

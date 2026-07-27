@@ -1,6 +1,7 @@
 #include "rcube_cmd.h"
 #include "rcube_config.h"
 #include "rcube_status.h"
+#include "rcube_sensor.h"
 #include "board_led.h"
 
 #include <string.h>
@@ -224,6 +225,50 @@ static void reply_node_config(void)
              f[4], f[5], f[6], f[7]);
 }
 
+/* ---- 센서 모니터링 (기획서 9장) -------------------------------------- */
+
+/* B1 SetSensorStream: payload = [on] 또는 [on, period_hi, period_lo].
+ * 브로드캐스트로 오면 상위(허브/edge central)가 전 멤버로 먼저 팬아웃한 뒤 자기도 적용. */
+static uint8_t handle_set_sensor_stream(const uint8_t *p, uint16_t plen)
+{
+    if (plen < 1) {
+        return RCUBE_RC_BAD_LENGTH;
+    }
+    bool on = (p[0] != 0);
+    uint16_t period = (plen >= 3) ? (uint16_t)((p[1] << 8) | p[2])
+                                  : RCUBE_SENSOR_PERIOD_DEFAULT_MS;
+    if (!rcube_sensor_set_stream(on, period)) {
+        return RCUBE_RC_BAD_PARAM;
+    }
+    return RCUBE_RC_OK;
+}
+
+int rcube_cmd_send_frame(const uint8_t *frame, uint16_t len)
+{
+    if (s_ops.send == NULL) {
+        return -1;
+    }
+    return s_ops.send(frame, len);
+}
+
+int rcube_cmd_sensor_stream_all(bool on, uint16_t period_ms)
+{
+    /* 자기 자신부터 적용(허브/edge central도 유닛의 한 큐브다 — 9장 "자신의 데이터와 함께"). */
+    rcube_sensor_set_stream(on, period_ms);
+
+    uint8_t f[HEADER_LEN + 3];
+    uint16_t total = sizeof(f);
+    put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_SetSensorStream, total);
+    f[4] = on ? 1 : 0;
+    f[5] = (uint8_t)((period_ms >> 8) & 0xFF);
+    f[6] = (uint8_t)(period_ms & 0xFF);
+
+    int sent = (s_ops.forward_all != NULL) ? s_ops.forward_all(f, total) : 0;
+    ESP_LOGI(TAG, "센서 전송 %s 지시: 자신 + BLE 멤버 %d대 (주기 %u ms)",
+             on ? "시작" : "중지", sent < 0 ? 0 : sent, period_ms);
+    return sent;
+}
+
 /* D5 SetEdgeCentralConfig: 독립로봇유닛 전환/강등 (기획서 7.3-3 ★보강).
  *   payload = [ecf, unit_n, term_id, map[8]]  (총 11바이트)
  *     ecf     : 1=edge central(리드 큐브), 0=강등(일반 큐브 — 맵도 삭제)
@@ -386,6 +431,19 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
             s_ops.forward_all(data, len);   /* 전 멤버도 초기화 */
         }
         rc = handle_reset_config();
+        reply_cmd_ack(op, rc);
+        break;
+
+    case RCUBE_OP_GetSensors:
+        rcube_sensor_report_once();   /* 회신 자체가 응답 */
+        break;
+
+    case RCUBE_OP_SetSensorStream:
+        /* 브로드캐스트면 허브/edge central이 먼저 전 멤버로 중계한 뒤 자기도 적용. */
+        if (target == RCUBE_ADDR_BROADCAST && s_ops.forward_all != NULL) {
+            s_ops.forward_all(data, len);
+        }
+        rc = handle_set_sensor_stream(payload, plen);
         reply_cmd_ack(op, rc);
         break;
 

@@ -4,6 +4,7 @@
 #include "rcube_buzzer.h"
 #include "rcube_config.h"
 #include "rcube_status.h"
+#include "rcube_sensor.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -343,7 +344,11 @@ static void member_ready(member_t *m)
         /* 허브/edge central LED: 멤버 전원 연결 → 점멸에서 상시 점등으로. */
         rcube_status_set_mode(RCUBE_LED_LINKED);
         if (s_edge) {
-            /* 기획서 7.4-6: 여기서 저장된 미션코드 실행으로 넘어간다.
+            /* 기획서 9장 [독립로봇유닛]: 연결이 완료되면 edge central이 전체 큐브에
+             * 센서 전송 시작 명령을 보낸다. BLE 분기는 여기서, CAN 분기는
+             * can_transport가 자기 완료 시점에 따로 지시한다. */
+            rcube_cmd_sensor_stream_all(true, RCUBE_SENSOR_PERIOD_DEFAULT_MS);
+            /* 기획서 7.4-6: 이어서 저장된 미션코드 실행으로 넘어간다.
              * 미션코드(F0~F4)는 8장 설계 확정 후 별도 구현. */
             ESP_LOGI(TAG, "edge central: BLE 멤버 전원 연결 완료 "
                           "(미션코드 실행은 8장에서 연결 예정)");

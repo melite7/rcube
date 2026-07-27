@@ -35,6 +35,7 @@
 #include "rcube_status.h"
 #include "bmi088.h"
 #include "can_transport.h"
+#include "rcube_sensor.h"
 
 static const char *TAG = "rcube";
 
@@ -242,6 +243,9 @@ void app_main(void)
     ESP_LOGI(TAG, "boot OK -> LED(노드ID %s) + %s melody",
              rcube_config_node_id() ? "색 점멸" : "흰색 점멸(미할당)",
              rcube_melody(boot_melody)->name);
+
+    /* 센서 모니터링(기획서 9장) — 전송은 상위의 B1 명령으로 시작한다. */
+    rcube_sensor_init();
 
     /* IMU(BMI088) SPI 환경 준비 + 검증. 검출되면 주기 읽기 태스크 기동. */
     bmi088_init();
