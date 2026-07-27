@@ -22,6 +22,8 @@
 #include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 
@@ -49,7 +51,14 @@ static void motion_task(void *arg)
     while (1) {
         /* TODO(Phase1): 현재 목표값 → 모터보드 UART 키프레임 송출 + 상태 수신 */
         if ((tick % 250) == 0) {   /* 5초마다 한 번만 로깅(BLE 로그 가독성) */
-            ESP_LOGI(TAG, "[core%d] motion tick %lu", xPortGetCoreID(), (unsigned long)tick);
+            /* 런타임 여유도 같이 남긴다 — 멤버가 붙을 때마다 얼마나 줄어드는지가
+             * MicroPython에 남겨 줄 수 있는 몫을 정한다(12.5 실측). */
+            ESP_LOGI(TAG, "[core%d] motion tick %lu · internal free=%u KB (largest %u KB), "
+                          "최저기록 %u KB",
+                     xPortGetCoreID(), (unsigned long)tick,
+                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                     (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                     (unsigned)(esp_get_minimum_free_heap_size() / 1024));
         }
         tick++;
         vTaskDelayUntil(&last, period);
@@ -74,6 +83,26 @@ static void imu_task(void *arg)
         }
         vTaskDelayUntil(&last, period);
     }
+}
+
+/* ---- 메모리 실측 (MicroPython 임베딩 타당성 판단용, 12.5) -------------
+ * 관심 있는 숫자는 두 가지다.
+ *   free      : 남은 내부 RAM 총량
+ *   largest   : 최대 "연속" 블록 — MicroPython GC heap은 한 덩어리로 잡아야 하므로
+ *               총량이 아니라 이 값이 상한이다.
+ * PSRAM은 sdkconfig에 CONFIG_SPIRAM이 켜져 있을 때만 잡힌다(개발보드에 없으면 0). */
+static void log_heap(const char *stage)
+{
+    size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t large_int = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t large_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "[heap] %-22s internal free=%u KB (largest %u KB) · DMA free=%u KB · "
+                  "PSRAM free=%u KB (largest %u KB)",
+             stage, (unsigned)(free_int / 1024), (unsigned)(large_int / 1024),
+             (unsigned)(free_dma / 1024),
+             (unsigned)(free_psram / 1024), (unsigned)(large_psram / 1024));
 }
 
 /* 설정모드 진입 롱프레스 임계(기획서 0724: 대기모드 3초). */
@@ -178,6 +207,7 @@ void app_main(void)
     ESP_LOGI(TAG, "==== R-Cube firmware boot ====");
     ESP_LOGI(TAG, "chip: ESP32-S3, cores=%d, rev=%d", chip.cores, chip.revision);
     ESP_LOGI(TAG, "flash: %lu MB", (unsigned long)(flash_size / (1024 * 1024)));
+    log_heap("0 boot(기준선)");
 
     /* NVS: BLE(PHY 캘리브레이션 등)에서 필요. */
     esp_err_t ret = nvs_flash_init();
@@ -197,9 +227,11 @@ void app_main(void)
     /* LED / 부저 준비. 부팅 후 LED는 그룹번호 아이덴티티 표시가 담당한다. */
     board_led_init();
     rcube_buzzer_init();
+    log_heap("1 NVS+LED+부저");
 
     /* BLE 스택 초기화(광고는 버튼을 눌러야 시작). */
     ble_rcube_init();
+    log_heap("2 NimBLE(최대8연결)");
 
     /* 부팅 성공: 상태 LED 태스크 기동 + 부팅음.
      * 기획서 5장 [소리 규칙]: 노드ID가 있으면 자기 멜로디(ID1 C4, ID2 D4 …)를
@@ -243,6 +275,7 @@ void app_main(void)
                  (can_members && ble_members) ? "+" : "",
                  ble_members ? "BLE" : "");
     }
+    log_heap("3 +IMU/CAN");
 
     /* 모션 태스크를 Core 1에 명시 핀닝 (로드맵 12.2). */
     BaseType_t motion_ret = xTaskCreatePinnedToCore(motion_task, "motion", 4096, NULL,
@@ -257,6 +290,10 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "tasks created successfully");
     }
+
+    log_heap("4 전 태스크 기동 후");
+    ESP_LOGI(TAG, "[heap] ↑ '4'의 largest = MicroPython GC heap으로 뽑아낼 수 있는 상한(12.5). "
+                  "PSRAM free=0이면 sdkconfig에 CONFIG_SPIRAM 미설정(개발보드에 PSRAM 없음).");
 
     ESP_LOGI(TAG, "boot done. 버튼 짧게=연결모드(%s), 3초 롱프레스=설정모드(RCUBECONFIG.%02u.%02u).",
              rcube_config_cmf() == 1 ? "CAN 하트비트" : "BLE 광고 RCUBEROBOT",
