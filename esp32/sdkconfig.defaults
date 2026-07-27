@@ -21,7 +21,10 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
 # 멀티롤(Phase 5): 아그리게이터는 PC(peripheral) 1 + 멤버(central) 최대 3 = 4연결.
 # R4까지 커버하도록 동시 연결 수를 5로(여유 1). central/GATT client는 기본 활성.
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=5
+# 한 유닛 최대 8대(기획서 [연결 가능 최대 수]).
+#   서브 BLE 허브 : PC(peripheral) 1 + 멤버 7 = 8
+#   edge central  : BLE 멤버 최대 7
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=8
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_GATT_CLIENT=y
 

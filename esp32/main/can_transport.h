@@ -19,6 +19,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -28,3 +29,15 @@ esp_err_t can_transport_init(uint8_t node_id, uint8_t term_id);
 /* 임의 CAN 프레임 송신(저수준). 성공 ESP_OK. */
 esp_err_t can_transport_send(uint8_t priority, uint8_t op_code,
                              uint8_t dst, const uint8_t *data, uint8_t len);
+
+/* edge central(ECF=1)이 CAN 멤버를 기다리기 시작한다(기획서 7.4-4 [CMF=1 멤버]).
+ *
+ * 저장된 멤버 맵에서 CMF=CAN인 노드ID들을 기대 목록으로 잡고, 각 노드의
+ * 부팅 알림(NodeAnnounce) 또는 하트비트를 받으면 발견 처리한다. 노드ID 순서대로
+ * 발견되지 않아도 되며, 전부 모이면 완료 로그·멜로디를 낸다.
+ * CAN 멤버가 없으면 아무것도 하지 않고 false를 돌려준다. */
+bool can_transport_start_edge(void);
+
+/* edge central이 기대하는 CAN 멤버 중 현재까지 발견된 수 / 전체 수. */
+uint8_t can_transport_edge_found(void);
+uint8_t can_transport_edge_expected(void);

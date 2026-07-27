@@ -27,6 +27,7 @@
 
 #include "board_led.h"
 #include "ble_rcube.h"
+#include "ble_multirole.h"
 #include "rcube_config.h"
 #include "rcube_buzzer.h"
 #include "rcube_status.h"
@@ -78,6 +79,41 @@ static void imu_task(void *arg)
 /* 설정모드 진입 롱프레스 임계(기획서 0724: 대기모드 3초). */
 #define CONFIG_HOLD_MS 3000
 
+/* 연결모드 진입 동작 (기획서 5장 [연결모드 진입 동작], 7.4-2·3).
+ *
+ *   ECF=1 (edge central / 리드 큐브) : 스스로 central로 시작한다. PC가 없으므로
+ *     자기 광고는 하지 않고, 저장된 멤버 맵대로 BLE 멤버는 직접 스캔·연결하고
+ *     CAN 멤버는 부팅/하트비트로 발견한다. 엣지 멜로디를 연주한다.
+ *   ECF=0 (일반 큐브) : 연결대기 멜로디 + CMF에 따른 신호 발행
+ *     (BLE면 RCUBEROBOT 광고, CAN이면 광고 없이 하트비트로 상위가 붙는다). */
+static void enter_connect_mode(void)
+{
+    if (rcube_config_ecf() == 1) {
+        rcube_buzzer_play(RCUBE_MELODY_EDGE);
+        /* 노드01이므로 자기 노드ID 색(Red). 멤버 전원 연결 전까지 점멸. */
+        uint8_t r, g, b;
+        rcube_status_node_color(rcube_config_node_id(), &r, &g, &b);
+        rcube_status_set_color(r, g, b);
+        rcube_status_set_mode(RCUBE_LED_HUB_WAIT);
+
+        bool ble = ble_multirole_start_edge();
+        bool can = can_transport_start_edge();
+        ESP_LOGI(TAG, "연결모드: edge central 시작 (BLE 멤버 %s / CAN 멤버 %s)",
+                 ble ? "대기" : "없음", can ? "대기" : "없음");
+        if (!ble && !can) {
+            ESP_LOGW(TAG, "edge central인데 멤버 맵이 비어 있다 — 설정모드에서 재설정 필요");
+        }
+        return;
+    }
+
+    rcube_buzzer_play(RCUBE_MELODY_LINK_WAIT);
+    if (ble_rcube_start_advertising()) {
+        ESP_LOGI(TAG, "연결모드: BLE 광고 시작(RCUBEROBOT)");
+    } else {
+        ESP_LOGI(TAG, "연결모드: CAN 큐브 — 광고 없이 하트비트로 연결");
+    }
+}
+
 /* BOOT 버튼 감시:
  *   - 짧게 누름(<3s) : 연결모드(광고 RCUBEROBOT) + 버튼음.
  *   - 길게 누름(≥3s): 설정모드 진입 — 노드LED 흰색 0.25s 점멸 + 광고 RCUBECONFIG.
@@ -119,16 +155,7 @@ static void button_task(void *arg)
                 if (!config_triggered) {
                     bool first = rcube_status_enter_connect_mode();
                     if (first) {
-                        /* 기획서 5장 [소리 규칙]: 연결모드로 갈 때 멤버 큐브는
-                         * 연결대기 멜로디를 연주한다(edge central 멜로디는 7.3에서). */
-                        rcube_buzzer_play(RCUBE_MELODY_LINK_WAIT);
-                        /* CMF=0(BLE)면 광고 시작, CMF=1(CAN)이면 광고 없이
-                         * CAN 하트비트로 연결된다(부팅 시 이미 기동). */
-                        if (ble_rcube_start_advertising()) {
-                            ESP_LOGI(TAG, "BOOT short press -> connect mode: BLE 광고 시작");
-                        } else {
-                            ESP_LOGI(TAG, "BOOT short press -> connect mode: CAN 큐브(광고 없음)");
-                        }
+                        enter_connect_mode();
                     } else {
                         ESP_LOGI(TAG, "BOOT short press (already in connect/config)");
                     }
@@ -192,14 +219,29 @@ void app_main(void)
         ESP_LOGW(TAG, "IMU 미검출 → 읽기 태스크 생략(환경만 준비됨)");
     }
 
-    /* 통신방식이 CAN이면 TWAI 전송계층 기동(하트비트 발행 + CAN 명령 수신). */
-    if (rcube_config_cmf() == 1) {
+    /* 통신 서버 선택(기획서 7.4-3 ★서버선택).
+     *   - 일반 큐브 : 자기 CMF가 CAN이면 CAN 전송계층을 켠다.
+     *   - edge central(ECF=1) : 자기 CMF와 무관하게, 멤버 맵에 CAN 멤버가 하나라도
+     *     있으면 CAN 서버를 켠다(BLE 멤버는 연결모드에서 NimBLE central로 붙는다).
+     * 즉 CAN만/BLE만/둘 다가 맵에 따라 결정된다. */
+    const bool is_edge = (rcube_config_ecf() == 1);
+    const bool can_members = is_edge && rcube_config_has_member(RCUBE_MEMBER_CAN);
+    const bool ble_members = is_edge && rcube_config_has_member(RCUBE_MEMBER_BLE);
+    if (rcube_config_cmf() == 1 || can_members) {
         esp_err_t can_err = can_transport_init(rcube_config_node_id(), rcube_config_term_id());
         if (can_err == ESP_OK) {
-            ESP_LOGI(TAG, "CMF=CAN → CAN transport 활성(BLE는 설정/복구용으로만)");
+            ESP_LOGI(TAG, "CAN transport 활성(%s)",
+                     can_members ? "edge central: CAN 멤버 있음" : "CMF=CAN");
         } else {
             ESP_LOGE(TAG, "CAN transport 초기화 실패: %s", esp_err_to_name(can_err));
         }
+    }
+    if (is_edge) {
+        ESP_LOGI(TAG, "ECF=1 edge central: 유닛 %u대, 서버 = %s%s%s",
+                 rcube_config_unit_count(),
+                 can_members ? "CAN" : "",
+                 (can_members && ble_members) ? "+" : "",
+                 ble_members ? "BLE" : "");
     }
 
     /* 모션 태스크를 Core 1에 명시 핀닝 (로드맵 12.2). */

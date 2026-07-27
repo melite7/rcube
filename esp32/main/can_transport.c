@@ -1,5 +1,8 @@
 #include "can_transport.h"
 #include "rcube_cmd.h"
+#include "rcube_config.h"
+#include "rcube_status.h"
+#include "rcube_buzzer.h"
 
 #include <string.h>
 
@@ -24,6 +27,75 @@ static const char *TAG = "can";
 static uint8_t s_node_id;
 static uint8_t s_term_id;
 static bool s_running;
+
+/* ---- edge central(ECF=1)의 CAN 멤버 대기 상태 (기획서 7.4-4) ---- */
+static bool    s_edge;                       /* CAN 멤버 대기 중 */
+static uint8_t s_edge_expected;              /* 기대 CAN 멤버 수 */
+static uint8_t s_edge_found;                 /* 발견된 수 */
+static bool    s_edge_seen[RCUBE_MAX_NODES]; /* 인덱스 = 노드ID-1 */
+
+/* 멤버 노드ID를 발견 처리한다. 전부 모이면 완료 표시. rx_task에서만 호출. */
+static void edge_note_member(uint8_t node_id)
+{
+    if (!s_edge || node_id < 1 || node_id > RCUBE_MAX_NODES) {
+        return;
+    }
+    if (node_id == s_node_id) {
+        return;   /* 자기 자신 */
+    }
+    if (rcube_config_member_cmf(node_id) != RCUBE_MEMBER_CAN) {
+        return;   /* 우리 유닛의 CAN 멤버가 아님 */
+    }
+    if (s_edge_seen[node_id - 1]) {
+        return;   /* 이미 발견 */
+    }
+    s_edge_seen[node_id - 1] = true;
+    s_edge_found++;
+    ESP_LOGI(TAG, "edge central: CAN 멤버 노드 0x%02x 발견 (%u/%u)",
+             node_id, s_edge_found, s_edge_expected);
+
+    /* 기획서 7.4-5: 각 큐브는 고정형이라 자기 노드ID 색을 스스로 켠다.
+     * edge central은 확인만 하되, 색 확인 명령을 한 번 보내 표시를 맞춘다. */
+    uint8_t r, g, b;
+    rcube_status_node_color(node_id, &r, &g, &b);
+    uint8_t led[4] = {1, r, g, b};   /* SetSK6812LED payload = [n][R,G,B] */
+    can_transport_send(RCUBE_PRI_PERIPHERAL, RCUBE_OP_SetSK6812LED, node_id, led, sizeof(led));
+
+    if (s_edge_found >= s_edge_expected) {
+        ESP_LOGI(TAG, "edge central: CAN 멤버 전원 발견(%u대)", s_edge_expected);
+        rcube_buzzer_play(RCUBE_MELODY_LINK_COMPLETED);
+    } else {
+        rcube_buzzer_play(RCUBE_MELODY_LINK);
+    }
+}
+
+bool can_transport_start_edge(void)
+{
+    uint8_t me = rcube_config_node_id();
+    uint8_t expected = 0;
+    for (uint8_t nid = 1; nid <= RCUBE_MAX_NODES; nid++) {
+        if (nid != me && rcube_config_member_cmf(nid) == RCUBE_MEMBER_CAN) {
+            expected++;
+        }
+    }
+    if (expected == 0) {
+        ESP_LOGI(TAG, "edge central: CAN 멤버 없음 → CAN 서버 대기 생략");
+        return false;
+    }
+    if (!s_running) {
+        ESP_LOGE(TAG, "edge central: CAN 멤버가 있으나 TWAI 미기동 — 초기화 실패 확인");
+        return false;
+    }
+    memset(s_edge_seen, 0, sizeof(s_edge_seen));
+    s_edge_found = 0;
+    s_edge_expected = expected;
+    s_edge = true;
+    ESP_LOGI(TAG, "edge central: CAN 멤버 %u대 대기 시작(부팅/하트비트 수신)", expected);
+    return true;
+}
+
+uint8_t can_transport_edge_found(void)    { return s_edge_found; }
+uint8_t can_transport_edge_expected(void) { return s_edge_expected; }
 
 /* ---- 저수준 송신 ---------------------------------------------------- */
 esp_err_t can_transport_send(uint8_t priority, uint8_t op_code,
@@ -64,6 +136,15 @@ static void rx_task(void *arg)
         uint32_t id = msg.identifier;
         uint8_t op  = RCUBE_CAN_OPCODE(id);
         uint8_t dst = RCUBE_CAN_DST(id);
+        uint8_t src = RCUBE_CAN_SRC(id);
+
+        /* edge central: 멤버의 부팅 알림/하트비트로 존재를 확인한다(7.4-4).
+         * 이 두 프레임은 브로드캐스트로 오므로 아래 대상 필터보다 먼저 본다. */
+        if (s_edge && (op == RCUBE_OP_NodeAnnounce || op == RCUBE_OP_Heartbeat)) {
+            uint8_t nid = (msg.data_length_code >= 1) ? msg.data[0] : src;
+            edge_note_member(nid);
+            continue;
+        }
 
         /* 나(node_id)/허브(0xFE)/브로드캐스트(0xFF) 대상만 처리. */
         if (dst != s_node_id && dst != RCUBE_ADDR_HUB && dst != RCUBE_ADDR_BROADCAST) {

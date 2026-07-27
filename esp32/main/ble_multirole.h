@@ -17,6 +17,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* BLE 허브 승격: 멤버 스캔·연결 시작(link_count = 본인 포함 총 N).
@@ -29,7 +30,17 @@
  *     그 NN을 그대로 가상ID로 쓴다(연결 순서 무관). */
 void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode);
 
-/* 아그리게이터 해제: 모든 멤버 연결 종료·스캔 중지·상태 초기화. */
+/* edge central 시작(기획서 7.4-3·4 [BLE 멤버]).
+ *
+ * 독립로봇유닛에는 BLE 허브 큐브가 없다. ECF=1 큐브가 저장된 멤버 맵을 보고
+ * CMF=0(BLE)인 멤버 노드ID들에 직접 BLE scan → 다중 연결한다.
+ *   - 연결 순서는 전원 켜는 순서와 무관하며 스캐너인 edge central이 정한다.
+ *   - 각 멤버는 광고이름의 노드ID(RCUBEROBOT.GG.NN)로 식별·매핑된다.
+ *   - 맵에 없는 노드ID는 무시하고, 빠진 노드는 계속 스캔하며 기다린다.
+ * BLE 멤버가 하나도 없으면 아무것도 하지 않고 false를 돌려준다. */
+bool ble_multirole_start_edge(void);
+
+/* 아그리게이터/edge central 해제: 모든 멤버 연결 종료·스캔 중지·상태 초기화. */
 void ble_multirole_stop_aggregator(void);
 
 /* PC가 보낸, 멤버(가상ID target_id) 대상 프레임을 해당 멤버로 중계.

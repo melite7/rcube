@@ -35,6 +35,12 @@ static const rcube_note_t LINK_WAIT_NOTES[] = {
     {2, 120}, {6, 200},
 };
 
+/* ── EDGE (edge central 연결모드 진입): C4, E4, G4, C5 상행 아르페지오 ──
+ * 연결대기(2음)와 뚜렷이 구분되도록 4음 상행으로 둔다. */
+static const rcube_note_t EDGE_NOTES[] = {
+    {2, 110}, {4, 110}, {6, 110}, {9, 220},
+};
+
 /* ── 노드ID 부팅음 (기획서 5장: ID1 C4, ID2 D4 … 규칙) ──
  * piano_scale 인덱스 = 노드ID + 1 (ID1→idx2=C4 … ID8→idx9=C5).
  * "0.5초 연주, 0.5초 쉬고 0.5초 연주" 2회 연주. */
@@ -56,6 +62,7 @@ static const rcube_melody_t MELODIES[RCUBE_MELODY_COUNT] = {
     [RCUBE_MELODY_LINK]           = MELODY(LINK_NOTES, "LINK"),
     [RCUBE_MELODY_LINK_COMPLETED] = MELODY(LINK_COMPLETED_NOTES, "LINKCOMPLETED"),
     [RCUBE_MELODY_LINK_WAIT]      = MELODY(LINK_WAIT_NOTES, "LINKWAIT"),
+    [RCUBE_MELODY_EDGE]           = MELODY(EDGE_NOTES, "EDGE"),
     [RCUBE_MELODY_NODE_1]         = MELODY(NODE1_NOTES, "NODE1"),
     [RCUBE_MELODY_NODE_2]         = MELODY(NODE2_NOTES, "NODE2"),
     [RCUBE_MELODY_NODE_3]         = MELODY(NODE3_NOTES, "NODE3"),

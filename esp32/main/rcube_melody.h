@@ -37,6 +37,7 @@ typedef enum {
     RCUBE_MELODY_LINK,             /* 큐브 1개 연결 */
     RCUBE_MELODY_LINK_COMPLETED,   /* 전체 연결 완료(유닛구성완료) */
     RCUBE_MELODY_LINK_WAIT,        /* 연결모드 진입(연결대기) — 기획서 5장 [소리 규칙] */
+    RCUBE_MELODY_EDGE,             /* 연결모드 진입(edge central 전용 엣지 멜로디) */
     /* 노드ID 부팅음: ID1=C4, ID2=D4 … ID8=C5 를 0.5s 연주·0.5s 쉼·0.5s 연주.
      * 반드시 연속(NODE_1..NODE_8)이어야 한다 — rcube_melody_node_id()가 오프셋으로 쓴다. */
     RCUBE_MELODY_NODE_1,

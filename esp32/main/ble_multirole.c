@@ -23,8 +23,10 @@ static const char *TAG = "multi";
 #define RCUBE_NAME_PREFIX "RCUBE"
 #define RCUBE_NAME_PREFIX_LEN 5
 
-/* R4: 아그리게이터 제외 멤버 최대 3대. */
-#define MAX_MEMBERS 3
+/* 한 유닛 최대 8대(기획서 [연결 가능 최대 수]) → 자신을 뺀 멤버 최대 7대.
+ * NimBLE 동시 연결 수(CONFIG_BT_NIMBLE_MAX_CONNECTIONS)가 이보다 커야 한다
+ * — 서브 허브는 PC 연결(peripheral) 1개를 추가로 쓰므로 8이 필요하다. */
+#define MAX_MEMBERS (RCUBE_MAX_NODES - 1)
 
 /* 멤버로 중계할 프레임 임시 버퍼(LED 등 소형 명령). */
 #define FWD_BUF_MAX 96
@@ -53,6 +55,7 @@ static bool     s_active;
 static uint8_t  s_target_members;   /* 연결해야 할 멤버 수 = link_count-1 */
 static uint8_t  s_group_mode;
 static bool     s_ordered;          /* 고정형: 광고 nodeID(NN)를 그대로 가상ID로 사용 */
+static bool     s_edge;             /* edge central 모드: 멤버 맵의 BLE 노드만 연결 */
 static uint8_t  s_next_vid;         /* 비고정형 시 다음 멤버 가상ID(2부터, 연결순서) */
 static bool     s_connect_pending;  /* 연결 시도 1건 진행 중(직렬화) */
 static member_t s_members[MAX_MEMBERS];
@@ -173,6 +176,7 @@ void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode)
     }
 
     s_active = true;
+    s_edge = false;            /* 서브로봇유닛의 BLE 허브 역할 */
     s_target_members = members;
     s_group_mode = group_mode;
     /* 기획서 7.5: 노드ID 저장 여부가 곧 고정형 판정(별도 전환 명령 없음). */
@@ -213,6 +217,41 @@ void ble_multirole_stop_aggregator(void)
     s_target_members = 0;
     s_next_vid = 2;
     s_ordered = false;
+    s_edge = false;
+}
+
+bool ble_multirole_start_edge(void)
+{
+    ble_multirole_stop_aggregator();
+
+    /* 멤버 맵에서 BLE 멤버(자신 제외)를 센다. */
+    uint8_t me = rcube_config_node_id();
+    uint8_t ble_members = 0;
+    for (uint8_t nid = 1; nid <= RCUBE_MAX_NODES; nid++) {
+        if (nid != me && rcube_config_member_cmf(nid) == RCUBE_MEMBER_BLE) {
+            ble_members++;
+        }
+    }
+    if (ble_members == 0) {
+        ESP_LOGI(TAG, "edge central: BLE 멤버 없음 → BLE 서버 미기동(CAN 전용 유닛)");
+        return false;
+    }
+    if (ble_members > MAX_MEMBERS) {
+        ESP_LOGW(TAG, "BLE 멤버 %u > 최대 %u → 제한", ble_members, MAX_MEMBERS);
+        ble_members = MAX_MEMBERS;
+    }
+
+    s_active = true;
+    s_edge = true;
+    s_ordered = true;          /* 독립유닛은 항상 고정형 — 광고 노드ID로 식별 */
+    s_target_members = ble_members;
+    s_group_mode = 0;
+    s_next_vid = 2;
+    s_connect_pending = false;
+
+    ESP_LOGI(TAG, "edge central 시작: BLE 멤버 %u대 직접 연결(노드ID 매핑)", ble_members);
+    scan_if_needed();
+    return true;
 }
 
 int ble_multirole_forward(uint8_t target_id, const uint8_t *frame, uint16_t len)
@@ -291,15 +330,24 @@ static void member_ready(member_t *m)
     /* 고정형이면 광고 nodeID(NN)를 그대로 가상ID로, 아니면 연결순서(2,3,…). */
     m->vid = (s_ordered && m->nn >= 1) ? m->nn : s_next_vid++;
     uint8_t ready = count_ready();
-    ESP_LOGI(TAG, "멤버 READY: conn=%u vid=%u chr=%u cccd=%u (%u/%u)",
+    ESP_LOGI(TAG, "%s 멤버 READY: conn=%u vid=%u chr=%u cccd=%u (%u/%u)",
+             s_edge ? "[edge]" : "[hub]",
              m->conn_handle, m->vid, m->chr_val_handle, m->cccd_handle,
              ready, s_target_members);
-    rcube_cmd_report_members(ready);
-    /* 멤버 1개 연결음, 담당 BLE 분기가 전부 붙으면 유닛구성완료 멜로디(기획서 5장). */
+    if (!s_edge) {
+        rcube_cmd_report_members(ready);   /* 독립유닛에는 보고할 PC가 없다 */
+    }
+    /* 멤버 1개 연결음, 담당 분기가 전부 붙으면 유닛구성완료 멜로디(기획서 5장). */
     if (ready >= s_target_members) {
         rcube_buzzer_play(RCUBE_MELODY_LINK_COMPLETED);
-        /* 허브 LED: 멤버 전원 연결 → 점멸에서 상시 점등으로. */
+        /* 허브/edge central LED: 멤버 전원 연결 → 점멸에서 상시 점등으로. */
         rcube_status_set_mode(RCUBE_LED_LINKED);
+        if (s_edge) {
+            /* 기획서 7.4-6: 여기서 저장된 미션코드 실행으로 넘어간다.
+             * 미션코드(F0~F4)는 8장 설계 확정 후 별도 구현. */
+            ESP_LOGI(TAG, "edge central: BLE 멤버 전원 연결 완료 "
+                          "(미션코드 실행은 8장에서 연결 예정)");
+        }
     } else {
         rcube_buzzer_play(RCUBE_MELODY_LINK);
     }
@@ -499,6 +547,14 @@ static int disc_gap_event(struct ble_gap_event *event, void *arg)
      * (비연속 노드ID·혼합유닛의 BLE 부분집합도 처리됨.) */
     if (s_ordered && (!have_nn || nn < 1)) {
         return 0;
+    }
+    /* edge central(7.4-4)은 저장된 멤버 맵에 BLE로 올라 있는 노드ID만 받아들인다.
+     * 옆 유닛의 큐브나 CAN으로 세팅된 노드가 섞여 들어오는 것을 막는다. */
+    if (s_edge) {
+        if (nn == rcube_config_node_id() ||
+            rcube_config_member_cmf(nn) != RCUBE_MEMBER_BLE) {
+            return 0;
+        }
     }
     if (addr_known(&event->disc.addr)) {
         return 0;   /* 이미 연결(시도)한 기기 */

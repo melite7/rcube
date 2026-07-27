@@ -1,6 +1,7 @@
 #include "rcube_cmd.h"
 #include "rcube_config.h"
 #include "rcube_status.h"
+#include "board_led.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -9,6 +10,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_sleep.h"
 
 /* opcode/주소/결과코드는 shared-protocol(단일 소스)에서 그대로 가져온다. */
 #include "rcube_protocol.h"
@@ -138,6 +140,7 @@ static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
 #define REBOOT_DELAY_MS 800
 
 static bool s_reboot_scheduled;
+static bool s_shutdown_scheduled;
 
 static void reboot_task(void *arg)
 {
@@ -221,6 +224,92 @@ static void reply_node_config(void)
              f[4], f[5], f[6], f[7]);
 }
 
+/* D5 SetEdgeCentralConfig: 독립로봇유닛 전환/강등 (기획서 7.3-3 ★보강).
+ *   payload = [ecf, unit_n, term_id, map[8]]  (총 11바이트)
+ *     ecf     : 1=edge central(리드 큐브), 0=강등(일반 큐브 — 맵도 삭제)
+ *     unit_n  : 유닛 전체 큐브 수 N
+ *     term_id : CAN 세팅 멤버 중 최대 노드ID(자가 종단 판단용)
+ *     map[i]  : 노드ID(i+1)의 통신방식 — 0=BLE, 1=CAN, 0xFF=유닛에 없음
+ * 저장만 하고 재부팅하지 않는다. 배선 정리를 위해 이어서 E7(shutdown)을 받는다. */
+#define D5_PAYLOAD_LEN (3 + RCUBE_MAX_NODES)
+
+static uint8_t handle_set_edge_config(const uint8_t *p, uint16_t plen)
+{
+    if (plen < D5_PAYLOAD_LEN) {
+        ESP_LOGW(TAG, "D5: payload %u bytes (필요 %u)", plen, D5_PAYLOAD_LEN);
+        return RCUBE_RC_BAD_LENGTH;
+    }
+    uint8_t ecf = p[0], unit_n = p[1], term_id = p[2];
+    const uint8_t *map = &p[3];
+
+    if (ecf && (unit_n < 1 || unit_n > RCUBE_MAX_NODES)) {
+        ESP_LOGW(TAG, "D5: unit_n=%u 범위 초과(1~%u)", unit_n, RCUBE_MAX_NODES);
+        return RCUBE_RC_BAD_PARAM;
+    }
+    /* 종단노드ID는 CAN 큐브만 의미가 있다(7.2-2 ★). edge central도 자기 맵으로 판단. */
+    esp_err_t e = rcube_config_set_term_id(term_id);
+    if (e == ESP_OK) e = rcube_config_set_edge(ecf, unit_n, map);
+    if (e != ESP_OK) {
+        return RCUBE_RC_FLASH_FAIL;
+    }
+    ESP_LOGI(TAG, "D5 SetEdgeCentralConfig: ecf=%u unit_n=%u term=0x%02x 저장(재부팅 대기)",
+             ecf, unit_n, term_id);
+    return RCUBE_RC_OK;
+}
+
+/* D6 GetEdgeCentralConfig 회신: D5와 같은 레이아웃으로 현재 저장값을 돌려준다. */
+static void reply_edge_config(void)
+{
+    if (s_ops.send == NULL) {
+        return;
+    }
+    uint8_t f[HEADER_LEN + D5_PAYLOAD_LEN];
+    uint16_t total = sizeof(f);
+    put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_GetEdgeCentralConfig, total);
+    f[4] = rcube_config_ecf();
+    f[5] = rcube_config_unit_count();
+    f[6] = rcube_config_term_id();
+    memcpy(&f[7], rcube_config_member_map(), RCUBE_MAX_NODES);
+    s_ops.send(f, total);
+    ESP_LOGI(TAG, "→ 0xD6 회신: ecf=%u unit_n=%u term=0x%02x", f[4], f[5], f[6]);
+}
+
+/* E7 SetPowerState: payload=[state]. 0=shut down(전원 끄기), 그 외=무시.
+ * 기획서 7.3-4 "저장이 완료되면 PC는 모든 R큐브에 shut down 명령을 주어 모두 끈다."
+ * 개발보드에는 전원 차단 회로가 없으므로 딥슬립으로 대신한다(버튼으로 깨어남).
+ * 메인보드에서는 STM6601 전원 IC 제어로 교체해야 한다. */
+#define SHUTDOWN_DELAY_MS 600
+/* 딥슬립에서 깨울 핀 = BOOT 버튼(main.c의 BOOT_BTN_GPIO와 같은 핀). RTC IO여야 한다. */
+#define RCUBE_WAKE_GPIO 0
+
+static void shutdown_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(SHUTDOWN_DELAY_MS));   /* 회신·중계가 나갈 시간 */
+    board_led_set_all(0, 0, 0);
+    ESP_LOGW(TAG, "shutdown: 딥슬립 진입(BOOT 버튼으로 깨어남). "
+                  "메인보드에서는 STM6601 전원 차단으로 교체 필요.");
+    esp_sleep_enable_ext1_wakeup(1ULL << RCUBE_WAKE_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
+}
+
+static uint8_t handle_set_power_state(const uint8_t *p, uint16_t plen)
+{
+    if (plen < 1) {
+        return RCUBE_RC_BAD_LENGTH;
+    }
+    if (p[0] != 0) {
+        ESP_LOGW(TAG, "E7: state=%u 미지원(0=shutdown만)", p[0]);
+        return RCUBE_RC_BAD_PARAM;
+    }
+    if (s_shutdown_scheduled) {
+        return RCUBE_RC_OK;
+    }
+    s_shutdown_scheduled = true;
+    ESP_LOGW(TAG, "E7 SetPowerState: shut down 예약(%d ms 후)", SHUTDOWN_DELAY_MS);
+    xTaskCreate(shutdown_task, "shutdown", 2560, NULL, 5, NULL);
+    return RCUBE_RC_OK;
+}
+
 /* D7 ResetConfig: 공장 초기화(노드ID=0, CMF=BLE, 종단ID=0) 후 재부팅.
  * 기획서 7.3 [노드ID/세팅 초기화 - 공통]. 브로드캐스트면 전 멤버로 팬아웃된다. */
 static uint8_t handle_reset_config(void)
@@ -297,6 +386,23 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
             s_ops.forward_all(data, len);   /* 전 멤버도 초기화 */
         }
         rc = handle_reset_config();
+        reply_cmd_ack(op, rc);
+        break;
+
+    case RCUBE_OP_SetEdgeCentralConfig:
+        rc = handle_set_edge_config(payload, plen);
+        reply_cmd_ack(op, rc);
+        break;
+
+    case RCUBE_OP_GetEdgeCentralConfig:
+        reply_edge_config();   /* 회신 자체가 응답 */
+        break;
+
+    case RCUBE_OP_SetPowerState:
+        if (target == RCUBE_ADDR_BROADCAST && s_ops.forward_all != NULL) {
+            s_ops.forward_all(data, len);   /* 전 멤버도 함께 끈다(7.3-4) */
+        }
+        rc = handle_set_power_state(payload, plen);
         reply_cmd_ack(op, rc);
         break;
 
