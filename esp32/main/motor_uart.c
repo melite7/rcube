@@ -31,8 +31,7 @@ static const char *TAG = "motor";
  *   CONFIG_SPIRAM이 꺼져 있어 PSRAM 컨트롤러가 이 핀을 구동하지 않으므로 충돌하지
  *   않는다. PSRAM을 켜려면 양산 모듈(N16R2, Quad)로 가야 한다. */
 
-/* 보레이트: 매뉴얼에 명시가 없어 관례값을 쓴다. 실보드에서 확인 후 확정할 것.
- * (확장 규격 §6 미결 항목 3) */
+/* 보레이트 921600 — 2026-07-28 확정(매뉴얼에는 명시가 없다). */
 #define MC_BAUD 921600
 
 #define MC_RX_BUF   1024
@@ -44,7 +43,6 @@ static bool s_ready;
 static bool s_gate_enabled;
 static motor_status_t s_status;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool s_warned_erpm;
 
 /* ---- CRC-16/XMODEM (매뉴얼 crc16(): init 0x0000, poly 0x1021, MSB-first) ---- */
 static uint16_t crc16_xmodem(const uint8_t *d, size_t len)
@@ -488,10 +486,5 @@ esp_err_t motor_uart_init(void)
 
     ESP_LOGI(TAG, "모터 UART 준비: TX%d RX%d @%d, 게이트=차단, FAULT=IO%d",
              MC_TX_GPIO, MC_RX_GPIO, MC_BAUD, MC_FAULT_GPIO);
-    if (!s_warned_erpm) {
-        s_warned_erpm = true;
-        ESP_LOGW(TAG, "보레이트(%d)는 매뉴얼 미명시 관례값 — 실보드에서 확인 필요"
-                      " (확장 규격 §6-3)", MC_BAUD);
-    }
     return ESP_OK;
 }

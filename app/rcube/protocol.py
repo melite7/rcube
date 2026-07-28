@@ -267,6 +267,51 @@ def build_emergency_stop(*, target_id: int = ADDR_BROADCAST) -> bytes:
     return build_frame(target_id, OpCode.EmergencyStop, b"")
 
 
+# ---- TimeSync (확장 규격 §3.2) ----
+TS_FLAG_ROUNDTRIP = 0x01
+TS_FLAG_OFFSET = 0x02
+TS_FLAG_REPLY = 0x80
+
+
+def _u48(v: int) -> bytes:
+    return (int(v) & 0xFFFFFFFFFFFF).to_bytes(6, "big")
+
+
+def _i48(b: bytes) -> int:
+    v = int.from_bytes(b, "big")
+    return v - (1 << 48) if v & (1 << 47) else v
+
+
+def build_timesync(value_us: int, *, roundtrip: bool = False, offset: bool = False,
+                   target_id: int = ADDR_HUB) -> bytes:
+    """TimeSync(0xD2). payload = [flags][value(48비트 us, BE)] — 7바이트.
+
+    48비트인 이유는 64비트로 잡으면 9바이트가 되어 CAN 단일 프레임(8B)을 넘기기 때문이다.
+    - roundtrip=True : 큐브가 t_recv/t_send를 실어 회신한다(왕복 측정)
+    - offset=True    : value가 절대시각이 아니라 오프셋 보정값(부호 있음)
+    """
+    flags = (TS_FLAG_ROUNDTRIP if roundtrip else 0) | (TS_FLAG_OFFSET if offset else 0)
+    return build_frame(target_id, OpCode.TimeSync, bytes((flags,)) + _u48(value_us))
+
+
+def parse_timesync_reply(payload: bytes):
+    """0xD2 회신 → (t1_echo, t_recv, t_send). 회신 형식이 아니면 None."""
+    if len(payload) < 19 or not (payload[0] & TS_FLAG_REPLY):
+        return None
+    return _i48(payload[1:7]), _i48(payload[7:13]), _i48(payload[13:19])
+
+
+def timesync_solve(t1: int, t_recv: int, t_send: int, t4: int):
+    """SNTP 식으로 (offset, rtt)를 구한다. 단위 us.
+
+    theta  = ((t_recv - t1) + (t_send - t4)) / 2   → 큐브로컬 - 마스터
+    offset = -theta                                → 마스터 = 로컬 + offset
+    """
+    theta = ((t_recv - t1) + (t_send - t4)) / 2
+    rtt = (t4 - t1) - (t_send - t_recv)
+    return int(-theta), int(rtt)
+
+
 def build_get_motor_status(*, target_id: int = ADDR_HUB) -> bytes:
     """GetMotorStatus(0xB2). 회신 = [err][position(int32, 0.01°)][current(int16, 0.01A)]."""
     return build_frame(target_id, OpCode.GetMotorStatus, b"")

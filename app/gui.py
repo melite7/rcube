@@ -20,6 +20,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -56,6 +57,9 @@ from rcube import (
     build_set_drive_state,
     build_emergency_stop,
     build_get_motor_status,
+    build_timesync,
+    parse_timesync_reply,
+    timesync_solve,
     parse_motor_status,
     parse_motion_complete,
     MOTION_REASON,
@@ -117,6 +121,10 @@ NODE_RGB = {
 }
 WHITE = (255, 255, 255)   # 노드ID 범위 밖(미할당 등) 대체색
 
+# TimeSync 왕복 측정 횟수. BLE는 connection event 대기로 지터가 커서 여러 번 재고
+# 최소 RTT 표본을 쓴다(확장 규격 §3.2).
+TIMESYNC_SAMPLES = 7
+
 
 BTN_IDLE = {"bg": "#b8b8b8", "fg": "#000000", "activebackground": "#a8a8a8"}
 BTN_BUSY = {"bg": "#e69500", "fg": "#ffffff", "activebackground": "#cf8600"}
@@ -155,6 +163,7 @@ class RCubeApp:
         self.scn_fixed = False    # 이번 시나리오가 고정형 재연결인지(시작 시 캡처)
         self.scn_ble_nodes = []   # 고정형: BLE로 세팅된 노드ID 목록(오름차순)
         self.scn_ble_members = 0  # 허브가 취합해야 할 BLE 멤버 수(= BLE 큐브 수 - 1)
+        self._ts_reply = None     # TimeSync 왕복 회신 (notify → _timesync_coro)
 
         root.title("R-Cube 제어 (BLE / CAN)")
         root.geometry("680x780")
@@ -297,6 +306,7 @@ class RCubeApp:
         ttk.Button(self.mot_bar2, text="Disable",
                    command=lambda: self.on_drive_state(DRIVE_DISABLE)).pack(side="left", padx=2)
         ttk.Button(self.mot_bar2, text="상태 조회", command=self.on_motor_status).pack(side="left", padx=8)
+        ttk.Button(self.mot_bar2, text="시계 동기", command=self.on_timesync).pack(side="left", padx=2)
         # 비상정지는 브로드캐스트라 대상 선택과 무관하다.
         tk.Button(self.mot_bar2, text="비상 정지(전체)", command=self.on_estop,
                   bg="#c0392b", fg="#ffffff", activebackground="#a93226").pack(side="left", padx=12)
@@ -753,6 +763,13 @@ class RCubeApp:
             self._on_sensor_frame(fr)
             return
         self._log(f"    └ {fr}", "rx")
+        if fr.op_code == int(OpCode.TimeSync):
+            # 왕복 측정 회신 — _timesync_coro가 기다리고 있다. 로그는 남기지 않는다
+            # (수십 회 반복되므로 로그창을 덮는다).
+            rep = parse_timesync_reply(fr.payload)
+            if rep:
+                self._ts_reply = rep
+            return
         if fr.op_code == int(OpCode.GetMotorStatus):
             st = parse_motor_status(fr.payload)
             if st:
@@ -973,6 +990,50 @@ class RCubeApp:
         if t is None or not self.ble.is_connected:
             return
         self._run(self.ble.send(build_get_motor_status(target_id=t)))
+
+    # ---- 시계 동기 (확장 규격 §3.2) ----
+    def on_timesync(self) -> None:
+        """유닛 전 큐브의 시계를 맞춘다. 다축 동기(T0)의 정확도가 여기서 결정된다."""
+        if not self.ble.is_connected:
+            self._log("[동기] 연결이 없습니다.", "err")
+            return
+        nodes = self._unit_nodes()
+        if not nodes:
+            return
+        self._log(f"[동기] TimeSync 시작 — {len(nodes)}대, 각 {TIMESYNC_SAMPLES}회 왕복 측정", "scn")
+        self._run(self._timesync_coro(nodes))
+
+    async def _timesync_coro(self, nodes: list) -> None:
+        for idx, nid in enumerate(nodes):
+            target = ADDR_HUB if idx == 0 else nid
+            best = None   # (rtt, offset)
+            for _ in range(TIMESYNC_SAMPLES):
+                self._ts_reply = None
+                t1 = time.perf_counter_ns() // 1000
+                await self.ble.send(build_timesync(t1, roundtrip=True, target_id=target))
+                # 회신은 notify로 오므로 _handle_notify가 _ts_reply에 채워 준다.
+                for _ in range(40):          # 최대 2초 대기
+                    if self._ts_reply is not None:
+                        break
+                    await asyncio.sleep(0.05)
+                if self._ts_reply is None:
+                    continue
+                t4 = time.perf_counter_ns() // 1000
+                _echo, t_recv, t_send = self._ts_reply
+                offset, rtt = timesync_solve(t1, t_recv, t_send, t4)
+                # BLE는 connection event 대기로 지터가 크다 → 최소 RTT 표본이 가장 정확하다.
+                if best is None or rtt < best[0]:
+                    best = (rtt, offset)
+                await asyncio.sleep(0.05)
+
+            if best is None:
+                self.ui_q.put(("log", f"[동기] 노드 {nid}: 회신 없음 — 건너뜀"))
+                continue
+            rtt, offset = best
+            await self.ble.send(build_timesync(offset, offset=True, target_id=target))
+            self.ui_q.put(("log", f"[동기] 노드 {nid}: offset {offset:+d} us "
+                                  f"(최소 RTT {rtt} us) 적용"))
+        self.ui_q.put(("log", "[동기] 완료 — 이제 ExecuteBuffer(Run, T0) 다축 동기가 유효합니다"))
 
     def on_estop(self) -> None:
         """비상 정지 — 브로드캐스트라 대상 선택과 무관하게 전 큐브가 멈춘다."""

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "rcube_protocol.h"
 
@@ -159,6 +160,67 @@ static uint8_t handle_drive_state(const uint8_t *p, uint16_t len)
     return RCUBE_RC_OK;
 }
 
+/* ---- D2 TimeSync (확장 규격 §3.2) ------------------------------------
+ * 시각 값은 48비트 마이크로초(6바이트). 64비트로 잡으면 요청이 9바이트가 되어
+ * CAN 단일 프레임(8B)을 넘긴다.
+ *
+ * 다축 동기의 정확도가 여기서 결정된다 — 드라이버에는 예약 실행이 없으므로
+ * ExecuteBuffer(Run, T0)의 T0를 각 큐브가 "자기 시계로" 기다린다(§3.1). */
+#define TS_FLAG_ROUNDTRIP 0x01u   /* 왕복 측정 요청 */
+#define TS_FLAG_OFFSET    0x02u   /* value가 절대시각이 아니라 오프셋 보정값 */
+#define TS_FLAG_REPLY     0x80u
+
+static void wr_u48(uint8_t *p, int64_t v)
+{
+    p[0] = (uint8_t)((v >> 40) & 0xFF); p[1] = (uint8_t)((v >> 32) & 0xFF);
+    p[2] = (uint8_t)((v >> 24) & 0xFF); p[3] = (uint8_t)((v >> 16) & 0xFF);
+    p[4] = (uint8_t)((v >> 8) & 0xFF);  p[5] = (uint8_t)(v & 0xFF);
+}
+
+/* 부호 있는 48비트로 해석(오프셋은 음수일 수 있다). */
+static int64_t rd_i48(const uint8_t *p)
+{
+    uint64_t v = ((uint64_t)p[0] << 40) | ((uint64_t)p[1] << 32) | ((uint64_t)p[2] << 24) |
+                 ((uint64_t)p[3] << 16) | ((uint64_t)p[4] << 8) | p[5];
+    if (v & 0x0000800000000000ull) {
+        v |= 0xFFFF000000000000ull;   /* 부호 확장 */
+    }
+    return (int64_t)v;
+}
+
+static uint8_t handle_timesync(const uint8_t *p, uint16_t len)
+{
+    /* 수신 시각을 가장 먼저 찍는다 — 뒤의 처리 시간이 측정에 섞이지 않게. */
+    int64_t t_recv = esp_timer_get_time();
+
+    if (len < 7) return RCUBE_RC_BAD_LENGTH;
+    uint8_t flags = p[0];
+    int64_t value = rd_i48(&p[1]);
+
+    if (flags & TS_FLAG_OFFSET) {
+        /* 마스터가 왕복 측정으로 구한 보정값을 그대로 적용한다. */
+        motion_core_set_time_offset(value);
+    } else if (!(flags & TS_FLAG_ROUNDTRIP)) {
+        /* 단방향 배포: 편도 지연만큼 오차가 남는다(정밀도 필요 없을 때만). */
+        motion_core_set_time_offset(value - t_recv);
+    }
+
+    if (flags & TS_FLAG_ROUNDTRIP) {
+        uint8_t f[HEADER_LEN + 19];
+        uint16_t total = sizeof(f);
+        f[0] = RCUBE_ADDR_HUB;
+        f[1] = RCUBE_OP_TimeSync;
+        f[2] = (uint8_t)((total >> 8) & 0xFF);
+        f[3] = (uint8_t)(total & 0xFF);
+        f[4] = (uint8_t)(flags | TS_FLAG_REPLY);
+        wr_u48(&f[5], value);            /* 마스터가 보낸 T1 그대로 되돌린다 */
+        wr_u48(&f[11], t_recv);
+        wr_u48(&f[17], esp_timer_get_time());   /* 회신 직전 시각 */
+        rcube_cmd_send_frame(f, total);
+    }
+    return RCUBE_RC_OK;
+}
+
 /* ---- 조회 회신 ------------------------------------------------------- */
 
 void rcube_motion_report_status(void)
@@ -206,6 +268,7 @@ bool rcube_motion_handle(uint8_t op, const uint8_t *payload, uint16_t plen, uint
     case RCUBE_OP_SetSingleAngle:     rc = handle_single_angle(payload, plen); break;
     case RCUBE_OP_SetScheduledAngles: rc = handle_scheduled(payload, plen); break;
     case RCUBE_OP_ExecuteBuffer:      rc = handle_execute(payload, plen); break;
+    case RCUBE_OP_TimeSync:           rc = handle_timesync(payload, plen); break;
     case RCUBE_OP_MoveToOrigin:       rc = handle_move_origin(payload, plen); break;
     case RCUBE_OP_SetDriveState:      rc = handle_drive_state(payload, plen); break;
 
