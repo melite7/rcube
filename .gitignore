@@ -2,6 +2,10 @@
 # R큐브 저장소 공통 .gitignore
 # ==========================================================
 
+# ---- Claude Code 개인 설정 ----
+# settings.json은 팀 공유(커밋), settings.local.json은 개인용이라 커밋하지 않는다.
+**/.claude/settings.local.json
+
 # ---- ESP-IDF / ESP32 펌웨어 (esp32/) ----
 build/
 sdkconfig
