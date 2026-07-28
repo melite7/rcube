@@ -2,6 +2,7 @@
 #include "rcube_config.h"
 #include "rcube_status.h"
 #include "rcube_sensor.h"
+#include "rcube_motion.h"
 #include "board_led.h"
 
 #include <string.h>
@@ -399,6 +400,16 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
     }
 
     uint8_t rc;
+
+    /* 모션 계열(C0~C9·CB·D0·B2·B6)은 전용 레이어가 처리한다.
+     * 조회(B2/B6)는 회신이 곧 응답이라 CmdAck을 따로 보내지 않는다. */
+    if (rcube_motion_handle(op, payload, plen, &rc)) {
+        if (op != RCUBE_OP_GetMotorStatus && op != RCUBE_OP_GetPosition) {
+            reply_cmd_ack(op, rc);
+        }
+        return;
+    }
+
     switch (op) {
     case RCUBE_OP_SetSK6812LED:
         rc = handle_set_led(payload, plen);

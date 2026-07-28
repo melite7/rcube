@@ -196,6 +196,110 @@ def build_get_node_config(*, target_id: int = ADDR_HUB) -> bytes:
     return build_frame(target_id, OpCode.GetNodeConfig, b"")
 
 
+# ---- 모션 명령 (확장 규격 §2.11 / §3.4) ----
+MOTION_IMMEDIATE = 0x00
+MOTION_BUFFERED = 0x01
+
+EXEC_RUN = 0x01
+EXEC_CANCEL = 0x02
+EXEC_FLUSH = 0x03
+
+DRIVE_DISABLE = 0x00
+DRIVE_ENABLE = 0x01
+DRIVE_QUICKSTOP = 0x02
+DRIVE_FAULT_RESET = 0x03
+
+
+def _i32(v: int) -> bytes:
+    return int(v).to_bytes(4, "big", signed=True)
+
+
+def build_set_angle(deg: float, t_ms: int = 0, *, buffered: bool = False,
+                    target_id: int = ADDR_HUB) -> bytes:
+    """SetSingleAngle(0xC1). payload = [mode][position(int32, 0.01°)][t_ms(uint16)].
+
+    t_ms는 도달 시간(기획서 11장 "목표위치 + 도달시간"). 0이면 드라이버 기본 속도.
+    buffered=True면 적재만 하고 ExecuteBuffer(Run)를 기다린다.
+    """
+    mode = MOTION_BUFFERED if buffered else MOTION_IMMEDIATE
+    payload = bytes((mode,)) + _i32(round(deg * 100)) + int(t_ms).to_bytes(2, "big")
+    return build_frame(target_id, OpCode.SetSingleAngle, payload)
+
+
+def build_set_speed(dps: float, *, buffered: bool = False, target_id: int = ADDR_HUB) -> bytes:
+    """SetSingleSpeed(0xC0). payload = [mode][velocity(int32, 0.01°/s)]."""
+    mode = MOTION_BUFFERED if buffered else MOTION_IMMEDIATE
+    return build_frame(target_id, OpCode.SetSingleSpeed,
+                       bytes((mode,)) + _i32(round(dps * 100)))
+
+
+def build_move_to_origin(t_ms: int = 0, *, buffered: bool = False,
+                         target_id: int = ADDR_HUB) -> bytes:
+    """MoveToOrigin(0xC8). payload = [mode][t_ms(uint16)]."""
+    mode = MOTION_BUFFERED if buffered else MOTION_IMMEDIATE
+    return build_frame(target_id, OpCode.MoveToOrigin,
+                       bytes((mode,)) + int(t_ms).to_bytes(2, "big"))
+
+
+def build_set_this_to_origin(*, target_id: int = ADDR_HUB) -> bytes:
+    """SetThisToOrigin(0xC9). 현재 위치를 원점으로 저장."""
+    return build_frame(target_id, OpCode.SetThisToOrigin, b"")
+
+
+def build_set_drive_state(state: int, *, target_id: int = ADDR_HUB) -> bytes:
+    """SetDriveState(0xCB). payload = [state] — DRIVE_* 상수 참조."""
+    return build_frame(target_id, OpCode.SetDriveState, bytes((state & 0xFF,)))
+
+
+def build_execute_buffer(action: int, t_start_us: int = 0,
+                         *, target_id: int = ADDR_BROADCAST) -> bytes:
+    """ExecuteBuffer(0xC7). payload = [action][t_start_us(uint64)].
+
+    기본 브로드캐스트: 각 축에 궤적을 Buffered로 적재한 뒤 Run(T0)을 뿌리면 전 축이
+    T0에 일제히 출발한다(확장 규격 §3.4 다축 동기).
+    """
+    return build_frame(target_id, OpCode.ExecuteBuffer,
+                       bytes((action & 0xFF,)) + int(t_start_us).to_bytes(8, "big"))
+
+
+def build_emergency_stop(*, target_id: int = ADDR_BROADCAST) -> bytes:
+    """EmergencyStop(0xD0). 큐를 비우고 게이트를 차단한다."""
+    return build_frame(target_id, OpCode.EmergencyStop, b"")
+
+
+def build_get_motor_status(*, target_id: int = ADDR_HUB) -> bytes:
+    """GetMotorStatus(0xB2). 회신 = [err][position(int32, 0.01°)][current(int16, 0.01A)]."""
+    return build_frame(target_id, OpCode.GetMotorStatus, b"")
+
+
+def parse_motor_status(payload: bytes):
+    """0xB2 회신 → (err_code, position_deg, current_a). 형식이 아니면 None."""
+    if len(payload) < 7:
+        return None
+    err = payload[0]
+    pos = int.from_bytes(payload[1:5], "big", signed=True) / 100.0
+    cur = int.from_bytes(payload[5:7], "big", signed=True) / 100.0
+    return err, pos, cur
+
+
+def parse_motion_complete(payload: bytes):
+    """0xB7 MotionComplete → (reason, seq, position_deg, err). 형식이 아니면 None."""
+    if len(payload) < 8:
+        return None
+    reason = payload[0]
+    seq = int.from_bytes(payload[1:3], "big")
+    pos = int.from_bytes(payload[3:7], "big", signed=True) / 100.0
+    return reason, seq, pos, payload[7]
+
+
+MOTION_REASON = {
+    0x00: "in-position 도달",
+    0x01: "버퍼 실행 완료",
+    0x02: "취소됨",
+    0x03: "폴트로 중단",
+}
+
+
 # ---- 센서 모니터링 (기획서 9장) — 펌웨어 rcube_sensor.h와 일치 ----
 SENSOR_KIND_ACCEL = 0x00   # 가속도, 단위 mg
 SENSOR_KIND_GYRO = 0x01    # 자이로, 단위 0.1°/s

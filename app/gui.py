@@ -50,6 +50,17 @@ from rcube import (
     SENSOR_KIND_ACCEL,
     SENSOR_KIND_GYRO,
     SENSOR_PERIOD_DEFAULT_MS,
+    build_set_angle,
+    build_move_to_origin,
+    build_set_this_to_origin,
+    build_set_drive_state,
+    build_emergency_stop,
+    build_get_motor_status,
+    parse_motor_status,
+    parse_motion_complete,
+    MOTION_REASON,
+    DRIVE_DISABLE,
+    DRIVE_ENABLE,
     MAX_NODES,
     MEMBER_NONE,
     MEMBER_CAN,
@@ -263,6 +274,36 @@ class RCubeApp:
             self.sensf, text="R1~R4로 큐브가 모두 연결되면 센서 전송을 시작할 수 있습니다.")
         self._paint_sensors()
 
+        # 3d) 모터 제어 (확장 규격 §2.11)
+        self.motf = ttk.LabelFrame(self.root, text="모터 제어")
+        self.motf.pack(fill="x", **pad)
+        self.mot_bar = ttk.Frame(self.motf)
+        ttk.Label(self.mot_bar, text="대상").pack(side="left", padx=(8, 2))
+        self.mot_target = ttk.Combobox(self.mot_bar, state="readonly", width=6)
+        self.mot_target.pack(side="left")
+        ttk.Label(self.mot_bar, text="각도(°)").pack(side="left", padx=(10, 2))
+        self.mot_deg = tk.StringVar(value="90")
+        ttk.Entry(self.mot_bar, textvariable=self.mot_deg, width=7).pack(side="left")
+        ttk.Label(self.mot_bar, text="도달(ms)").pack(side="left", padx=(10, 2))
+        self.mot_ms = tk.StringVar(value="1000")
+        ttk.Entry(self.mot_bar, textvariable=self.mot_ms, width=7).pack(side="left")
+        ttk.Button(self.mot_bar, text="이동", command=self.on_motor_move).pack(side="left", padx=6)
+        ttk.Button(self.mot_bar, text="원점으로", command=self.on_motor_home).pack(side="left", padx=2)
+        ttk.Button(self.mot_bar, text="여기를 원점", command=self.on_motor_set_origin).pack(side="left", padx=2)
+
+        self.mot_bar2 = ttk.Frame(self.motf)
+        ttk.Button(self.mot_bar2, text="Enable",
+                   command=lambda: self.on_drive_state(DRIVE_ENABLE)).pack(side="left", padx=(8, 2))
+        ttk.Button(self.mot_bar2, text="Disable",
+                   command=lambda: self.on_drive_state(DRIVE_DISABLE)).pack(side="left", padx=2)
+        ttk.Button(self.mot_bar2, text="상태 조회", command=self.on_motor_status).pack(side="left", padx=8)
+        # 비상정지는 브로드캐스트라 대상 선택과 무관하다.
+        tk.Button(self.mot_bar2, text="비상 정지(전체)", command=self.on_estop,
+                  bg="#c0392b", fg="#ffffff", activebackground="#a93226").pack(side="left", padx=12)
+        self.mot_hint = ttk.Label(
+            self.motf, text="R1~R4로 큐브가 모두 연결되면 모터 제어를 쓸 수 있습니다.")
+        self._paint_motor()
+
         # 4) 로그
         logf = ttk.LabelFrame(self.root, text="로그")
         logf.pack(fill="both", expand=True, **pad)
@@ -395,6 +436,32 @@ class RCubeApp:
                 self.sens_labels[nid] = var
         self.sens_rows.pack(fill="x", pady=(0, 4))
 
+    # ---- 모터 제어 노출 ----
+    def _paint_motor(self) -> None:
+        ready = self._tools_ready()
+        for w in (self.mot_bar, self.mot_bar2, self.mot_hint):
+            w.pack_forget()
+        if not ready:
+            self.mot_hint.pack(side="left", padx=8, pady=4)
+            return
+        nodes = self._unit_nodes()
+        values = [str(n) for n in nodes]
+        if list(self.mot_target["values"]) != values:
+            self.mot_target["values"] = values
+            if values:
+                self.mot_target.current(0)
+        self.mot_bar.pack(fill="x", pady=(2, 0))
+        self.mot_bar2.pack(fill="x", pady=(0, 4))
+
+    def _motor_target(self):
+        """모터 명령의 TargetId. 유닛 첫 큐브는 허브(0xFE), 나머지는 그 주소."""
+        try:
+            nid = int(self.mot_target.get())
+        except (ValueError, TypeError):
+            return None
+        nodes = self._unit_nodes()
+        return ADDR_HUB if (nodes and nid == nodes[0]) else nid
+
     # ---- 연결 방식 안내문 ----
     def _paint_mode_hint(self) -> None:
         """선택한 연결 방식에 맞는 안내문. 고정형이면 저장된 매핑 구성을 보여준다."""
@@ -434,9 +501,10 @@ class RCubeApp:
                 b.configure(text=f"R{n}")
         # 네트워크 설정 UI: 시나리오 완료 시 큐브 수만큼 행 표시.
         self._set_net_ui(self.scn_total if (self.active is not None and self.scn_done) else 0)
-        # 설정 조회·공장 초기화·센서 모니터링: 유닛 구성이 끝난 뒤에만 노출.
+        # 설정 조회·공장 초기화·센서·모터: 유닛 구성이 끝난 뒤에만 노출.
         self._paint_tools()
         self._paint_sensors()
+        self._paint_motor()
 
     def _set_net_ui(self, n: int) -> None:
         """네트워크 설정 UI를 큐브 n개로 구성(0이면 안내문만). 안정 상태면 재구성 안 함."""
@@ -685,6 +753,23 @@ class RCubeApp:
             self._on_sensor_frame(fr)
             return
         self._log(f"    └ {fr}", "rx")
+        if fr.op_code == int(OpCode.GetMotorStatus):
+            st = parse_motor_status(fr.payload)
+            if st:
+                err, pos, cur = st
+                who = "허브" if fr.target_id == ADDR_HUB else f"노드 {fr.target_id}"
+                self._log(f"    └ [모터] {who}: 위치 {pos:.2f}° 전류 {cur:.2f}A "
+                          f"에러 0x{err:02X}", "scn")
+            return
+        if fr.op_code == int(OpCode.MotionComplete):
+            mc = parse_motion_complete(fr.payload)
+            if mc:
+                reason, seq, pos, err = mc
+                who = "허브" if fr.target_id == ADDR_HUB else f"노드 {fr.target_id}"
+                tag = "err" if reason == 0x03 else "scn"
+                self._log(f"    └ [모션완료] {who}: {MOTION_REASON.get(reason, reason)} "
+                          f"seq={seq} pos={pos:.2f}° err=0x{err:02X}", tag)
+            return
         if fr.op_code == int(OpCode.GetNodeConfig) and len(fr.payload) >= 4:
             # [group, node, cmf, term] — target은 허브가 재기입한 발신 큐브 가상ID.
             g, node, cmf, term = fr.payload[0], fr.payload[1], fr.payload[2], fr.payload[3]
@@ -838,6 +923,64 @@ class RCubeApp:
         elif kind == SENSOR_KIND_GYRO:
             gyr = f"gyro {x / 10:7.1f},{y / 10:7.1f},{z / 10:7.1f} °/s"
         var.set(f"{acc or 'acc —':<28} | {gyr or 'gyro —'}")
+
+    # ---- 모터 제어 (확장 규격 §2.11) ----
+    def on_motor_move(self) -> None:
+        t = self._motor_target()
+        if t is None or not self.ble.is_connected:
+            self._log("[모터] 대상/연결을 확인하세요.", "err")
+            return
+        try:
+            deg = float(self.mot_deg.get())
+            t_ms = int(self.mot_ms.get())
+        except ValueError:
+            self._log("[모터] 각도는 실수, 도달시간은 정수(ms)여야 합니다.", "err")
+            return
+        self._log(f"[모터] 노드 {self.mot_target.get()} → {deg}° / {t_ms}ms", "scn")
+        self._run(self.ble.send(build_set_angle(deg, t_ms, target_id=t)))
+
+    def on_motor_home(self) -> None:
+        t = self._motor_target()
+        if t is None or not self.ble.is_connected:
+            return
+        try:
+            t_ms = int(self.mot_ms.get())
+        except ValueError:
+            t_ms = 0
+        self._log(f"[모터] 노드 {self.mot_target.get()} → 원점(0°) / {t_ms}ms", "scn")
+        self._run(self.ble.send(build_move_to_origin(t_ms, target_id=t)))
+
+    def on_motor_set_origin(self) -> None:
+        t = self._motor_target()
+        if t is None or not self.ble.is_connected:
+            return
+        if not messagebox.askyesno("원점 설정",
+                                   "현재 위치를 이 큐브의 원점으로 저장합니다. 진행할까요?"):
+            return
+        self._log(f"[모터] 노드 {self.mot_target.get()} 현재 위치를 원점으로 저장", "scn")
+        self._run(self.ble.send(build_set_this_to_origin(target_id=t)))
+
+    def on_drive_state(self, state: int) -> None:
+        t = self._motor_target()
+        if t is None or not self.ble.is_connected:
+            return
+        name = {DRIVE_ENABLE: "Enable", DRIVE_DISABLE: "Disable"}.get(state, str(state))
+        self._log(f"[모터] 노드 {self.mot_target.get()} DriveState={name}", "scn")
+        self._run(self.ble.send(build_set_drive_state(state, target_id=t)))
+
+    def on_motor_status(self) -> None:
+        t = self._motor_target()
+        if t is None or not self.ble.is_connected:
+            return
+        self._run(self.ble.send(build_get_motor_status(target_id=t)))
+
+    def on_estop(self) -> None:
+        """비상 정지 — 브로드캐스트라 대상 선택과 무관하게 전 큐브가 멈춘다."""
+        if not self.ble.is_connected:
+            self._log("[모터] 연결이 없습니다.", "err")
+            return
+        self._log("[모터] ★ 비상 정지 브로드캐스트 — 전 큐브 큐 비움 + 게이트 차단", "err")
+        self._run(self.ble.send(build_emergency_stop()))
 
     def on_demote_edge(self) -> None:
         """독립 해제(강등) — ECF=0 + 멤버 맵 삭제 (기획서 7.3 [독립→일반 되돌리기]).
