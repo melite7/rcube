@@ -44,6 +44,61 @@ def find_xlsx() -> str:
     return hits[0]
 
 
+def find_extensions() -> list[str]:
+    """확장 규격 문서(docs/R큐브_프로토콜_확장_*.md). 날짜 오름차순."""
+    return sorted(glob.glob(os.path.join(ROOT, "docs", "*프로토콜_확장_*.md")))
+
+
+MD_ROW = re.compile(r"^\|\s*([A-Za-z_][A-Za-z0-9_]*)\s*\|\s*([0-9A-Fa-f]{2})\s*\|"
+                    r"\s*([^|]*)\|\s*([^|]*)\|")
+
+
+def parse_extension_opcodes(path: str) -> list[dict]:
+    """확장 문서의 <!-- GEN:OPCODES --> 표를 파싱한다.
+
+    xlsx는 읽기전용 기준 문서라 손대지 않고, 이후 확정된 OpCode는 확장 문서에 적는다.
+    생성기가 양쪽을 합쳐 헤더를 만들므로 '단일 소스' 원칙은 그대로 유지된다.
+    """
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r"<!--\s*GEN:OPCODES\s*-->(.*?)<!--\s*/GEN:OPCODES\s*-->", text, re.S)
+    if not m:
+        return []
+    out = []
+    for line in m.group(1).splitlines():
+        row = MD_ROW.match(line.strip())
+        if not row:
+            continue
+        name, code, category, ble_can = row.groups()
+        if name.lower() == "이름" or set(code) <= {"-"}:
+            continue
+        out.append({
+            "name": name.strip(),
+            "code": int(code, 16),
+            "category": category.strip(),
+            "ble_can": ble_can.strip(),
+            "src": os.path.basename(path),
+        })
+    return out
+
+
+def merge_opcodes(base: list[dict], ext: list[dict]) -> list[dict]:
+    """확장 OpCode를 병합한다. 이름/코드 중복은 즉시 실패시킨다(조용한 덮어쓰기 금지)."""
+    by_name = {o["name"]: o for o in base}
+    by_code = {o["code"]: o for o in base}
+    for e in ext:
+        if e["name"] in by_name:
+            sys.exit(f"확장 OpCode 이름 중복: {e['name']} ({e['src']})")
+        if e["code"] in by_code:
+            dup = by_code[e["code"]]["name"]
+            sys.exit(f"확장 OpCode 코드 중복: 0x{e['code']:02X} "
+                     f"{e['name']} vs {dup} ({e['src']})")
+        by_name[e["name"]] = e
+        by_code[e["code"]] = e
+        base.append(e)
+    return base
+
+
 def parse_opcodes(wb) -> list[dict]:
     ws = wb["STATEMENTS"]
     # 헤더 행(‘분류 | Callback Function | Op Code | 비고 | BLE/CAN’) 찾기
@@ -198,10 +253,28 @@ typedef struct __attribute__((packed)) {
 
 #define RCUBE_CAN_SRC_MASTER 0xFEu   /* PC 또는 edge central */
 
+/* =====================================================================
+ * CAN 멀티프레임 (MULTI=1) — 확장 규격 §5
+ *   MULTI=0 : 단일 프레임(데이터필드 전체가 페이로드)
+ *   MULTI=1 : 데이터필드 [0]=세그먼트 헤더, [1:7]=페이로드 조각
+ *       세그먼트 헤더  bit7=FIRST, bit6=LAST, bit5:0=순번(0~63)
+ *       FIRST 세그먼트의 페이로드 앞 2바이트 = 전체 길이(BE16)
+ *       → FIRST 데이터 5바이트, 이후 7바이트씩. 최대 5+63*7 = 446바이트.
+ *   재조립은 (SrcId, OpCode)별 버퍼 1개. 순번 불일치 또는 타임아웃이면 폐기한다.
+ * ===================================================================== */
+#define RCUBE_CAN_SEG_FIRST      0x80u
+#define RCUBE_CAN_SEG_LAST       0x40u
+#define RCUBE_CAN_SEG_INDEX(h)   ((h) & 0x3Fu)
+#define RCUBE_CAN_SEG_MAX_INDEX  0x3Fu
+#define RCUBE_CAN_SEG_FIRST_DATA 5u      /* FIRST 세그먼트가 싣는 실데이터 바이트 */
+#define RCUBE_CAN_SEG_DATA       7u      /* 이후 세그먼트가 싣는 바이트 */
+#define RCUBE_CAN_REASSEMBLY_MAX 446u    /* 멀티프레임 최대 페이로드 */
+#define RCUBE_CAN_REASSEMBLY_TIMEOUT_MS 200u
+
 /* ---- CAN 우선순위 클래스 (CAN 시트 C절, 낮을수록 우선) ---- */
 typedef enum {
     RCUBE_PRI_ESTOP        = 0,  /* D0 EmergencyStop 최우선 */
-    RCUBE_PRI_SAFETY_SYNC  = 1,  /* D1·D2·D9·C7 */
+    RCUBE_PRI_SAFETY_SYNC  = 1,  /* D1·D2·D9·C7·B7 (B7=MotionComplete: 시퀀스 게이트) */
     RCUBE_PRI_MOTION       = 2,  /* C0~C3·C5·C8~CF */
     RCUBE_PRI_QUERY        = 3,  /* AF·B0~B6 */
     RCUBE_PRI_PERIPHERAL   = 4,  /* E0~E3·E5~E7·EA~ED */
@@ -251,9 +324,21 @@ def main() -> int:
     wb = openpyxl.load_workbook(src_path, data_only=True)
     ops = parse_opcodes(wb)
     rcs = parse_resultcodes(wb)
+    base_n = len(ops)
 
-    print(f"[gen_protocol] 원본: docs/{src}")
-    print(f"[gen_protocol] OpCode {len(ops)}개, ResultCode {len(rcs)}개 파싱")
+    ext_files = find_extensions()
+    for p in ext_files:
+        ext = parse_extension_opcodes(p)
+        if ext:
+            ops = merge_opcodes(ops, ext)
+            print(f"[gen_protocol] 확장: docs/{os.path.basename(p)} "
+                  f"→ OpCode {len(ext)}개 병합")
+    if ext_files:
+        src = src + " + " + ", ".join(os.path.basename(p) for p in ext_files)
+
+    print(f"[gen_protocol] 원본: docs/{os.path.basename(src_path)}")
+    print(f"[gen_protocol] OpCode {len(ops)}개(기준 {base_n} + 확장 {len(ops) - base_n}), "
+          f"ResultCode {len(rcs)}개")
 
     if args.check:
         for o in ops:

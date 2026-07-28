@@ -2,8 +2,8 @@
  * rcube_protocol.h
  * ----------------------------------------------------------------
  * ★ 자동 생성 파일 — 직접 수정 금지.
- *   원본: docs/R큐브_프로토콜_BLE_CAN__20260703.xlsx
- *   생성: tools/gen_protocol.py  (2026-07-23)
+ *   원본: docs/R큐브_프로토콜_BLE_CAN__20260703.xlsx + R큐브_프로토콜_확장_20260728.md
+ *   생성: tools/gen_protocol.py  (2026-07-28)
  *   수정이 필요하면 xlsx를 고치고 생성기를 다시 실행하세요.
  * ----------------------------------------------------------------
  */
@@ -55,10 +55,28 @@ typedef struct __attribute__((packed)) {
 
 #define RCUBE_CAN_SRC_MASTER 0xFEu   /* PC 또는 edge central */
 
+/* =====================================================================
+ * CAN 멀티프레임 (MULTI=1) — 확장 규격 §5
+ *   MULTI=0 : 단일 프레임(데이터필드 전체가 페이로드)
+ *   MULTI=1 : 데이터필드 [0]=세그먼트 헤더, [1:7]=페이로드 조각
+ *       세그먼트 헤더  bit7=FIRST, bit6=LAST, bit5:0=순번(0~63)
+ *       FIRST 세그먼트의 페이로드 앞 2바이트 = 전체 길이(BE16)
+ *       → FIRST 데이터 5바이트, 이후 7바이트씩. 최대 5+63*7 = 446바이트.
+ *   재조립은 (SrcId, OpCode)별 버퍼 1개. 순번 불일치 또는 타임아웃이면 폐기한다.
+ * ===================================================================== */
+#define RCUBE_CAN_SEG_FIRST      0x80u
+#define RCUBE_CAN_SEG_LAST       0x40u
+#define RCUBE_CAN_SEG_INDEX(h)   ((h) & 0x3Fu)
+#define RCUBE_CAN_SEG_MAX_INDEX  0x3Fu
+#define RCUBE_CAN_SEG_FIRST_DATA 5u      /* FIRST 세그먼트가 싣는 실데이터 바이트 */
+#define RCUBE_CAN_SEG_DATA       7u      /* 이후 세그먼트가 싣는 바이트 */
+#define RCUBE_CAN_REASSEMBLY_MAX 446u    /* 멀티프레임 최대 페이로드 */
+#define RCUBE_CAN_REASSEMBLY_TIMEOUT_MS 200u
+
 /* ---- CAN 우선순위 클래스 (CAN 시트 C절, 낮을수록 우선) ---- */
 typedef enum {
     RCUBE_PRI_ESTOP        = 0,  /* D0 EmergencyStop 최우선 */
-    RCUBE_PRI_SAFETY_SYNC  = 1,  /* D1·D2·D9·C7 */
+    RCUBE_PRI_SAFETY_SYNC  = 1,  /* D1·D2·D9·C7·B7 (B7=MotionComplete: 시퀀스 게이트) */
     RCUBE_PRI_MOTION       = 2,  /* C0~C3·C5·C8~CF */
     RCUBE_PRI_QUERY        = 3,  /* AF·B0~B6 */
     RCUBE_PRI_PERIPHERAL   = 4,  /* E0~E3·E5~E7·EA~ED */
