@@ -19,6 +19,8 @@ idf_component_register(
         "rcube_buzzer.c"
         "rcube_status.c"
         "rcube_sensor.c"
+        "motor_uart.c"
+        "motion_core.c"
         "bmi088.c"
         "can_transport.c"
     INCLUDE_DIRS

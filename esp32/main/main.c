@@ -36,32 +36,25 @@
 #include "bmi088.h"
 #include "can_transport.h"
 #include "rcube_sensor.h"
+#include "motor_uart.h"
+#include "motion_core.h"
 
 static const char *TAG = "rcube";
 
 /* ESP32-S3 DevKit의 BOOT 버튼은 GPIO0에 연결(외부 풀업, 눌림=Low). */
 #define BOOT_BTN_GPIO GPIO_NUM_0
 
-/* Core 1 실시간 모션 태스크 (placeholder).
- * 지금은 주기만 증명한다. Phase 1에서 모터 UART 키프레임 송출로 대체. */
-static void motion_task(void *arg)
+/* 힙 여유 주기 로깅(12.5 MicroPython 임베딩 실측용).
+ * 실시간 모션은 motion_core가 Core 1에서 전담하므로, 이 태스크는 Core 0에 둔다. */
+static void heaplog_task(void *arg)
 {
-    const TickType_t period = pdMS_TO_TICKS(20);   /* 50Hz 키프레임 주기(로드맵 11장) */
+    const TickType_t period = pdMS_TO_TICKS(5000);
     TickType_t last = xTaskGetTickCount();
-    uint32_t tick = 0;
     while (1) {
-        /* TODO(Phase1): 현재 목표값 → 모터보드 UART 키프레임 송출 + 상태 수신 */
-        if ((tick % 250) == 0) {   /* 5초마다 한 번만 로깅(BLE 로그 가독성) */
-            /* 런타임 여유도 같이 남긴다 — 멤버가 붙을 때마다 얼마나 줄어드는지가
-             * MicroPython에 남겨 줄 수 있는 몫을 정한다(12.5 실측). */
-            ESP_LOGI(TAG, "[core%d] motion tick %lu · internal free=%u KB (largest %u KB), "
-                          "최저기록 %u KB",
-                     xPortGetCoreID(), (unsigned long)tick,
-                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
-                     (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
-                     (unsigned)(esp_get_minimum_free_heap_size() / 1024));
-        }
-        tick++;
+        ESP_LOGI(TAG, "[heap] 런타임 internal free=%u KB (largest %u KB), 최저기록 %u KB",
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                 (unsigned)(esp_get_minimum_free_heap_size() / 1024));
         vTaskDelayUntil(&last, period);
     }
 }
@@ -210,6 +203,15 @@ void app_main(void)
     ESP_LOGI(TAG, "flash: %lu MB", (unsigned long)(flash_size / (1024 * 1024)));
     log_heap("0 boot(기준선)");
 
+    /* ★ 안전 최우선(핀맵 문서 §6): 다른 무엇보다 먼저 모터 게이트를 차단으로 잡는다.
+     * 부팅 중 의도치 않은 구동을 막기 위해 통신·설정보다 앞선다. */
+    if (motor_uart_init() == ESP_OK) {
+        int fail = motor_uart_selftest();
+        if (fail) {
+            ESP_LOGE(TAG, "모터 프로토콜 자체검증 실패 %d건 — 프레이밍 확인 필요", fail);
+        }
+    }
+
     /* NVS: BLE(PHY 캘리브레이션 등)에서 필요. */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -281,16 +283,16 @@ void app_main(void)
     }
     log_heap("3 +IMU/CAN");
 
-    /* 모션 태스크를 Core 1에 명시 핀닝 (로드맵 12.2). */
-    BaseType_t motion_ret = xTaskCreatePinnedToCore(motion_task, "motion", 4096, NULL,
-                                                    configMAX_PRIORITIES - 2, NULL, 1 /* core 1 */);
-    /* 버튼 감시 태스크는 Core 0(통신측). */
+    /* 실시간 모션 루프(Core 1 핀닝, 로드맵 12.2·12.3). */
+    motion_core_init();
+
+    /* 버튼 감시·힙 로깅 태스크는 Core 0(통신측). */
     BaseType_t btn_ret = xTaskCreatePinnedToCore(button_task, "button", 3072, NULL,
                                                  5, NULL, 0 /* core 0 */);
+    xTaskCreatePinnedToCore(heaplog_task, "heaplog", 3072, NULL, 1, NULL, 0);
 
-    if (motion_ret != pdPASS || btn_ret != pdPASS) {
-        ESP_LOGE(TAG, "task creation failed: motion=%d button=%d",
-                 (int)motion_ret, (int)btn_ret);
+    if (btn_ret != pdPASS) {
+        ESP_LOGE(TAG, "button task creation failed");
     } else {
         ESP_LOGI(TAG, "tasks created successfully");
     }
