@@ -26,9 +26,11 @@
 /* CAN 전송 계층 초기화 + 태스크 기동. node_id/term_id는 rcube_config 값. */
 esp_err_t can_transport_init(uint8_t node_id, uint8_t term_id);
 
-/* 임의 CAN 프레임 송신(저수준). 성공 ESP_OK. */
+/* 임의 CAN 프레임 송신(저수준). 성공 ESP_OK.
+ * len이 8을 넘으면 확장 규격 §5 멀티프레임(MULTI=1)으로 자동 분할한다
+ * (최대 RCUBE_CAN_REASSEMBLY_MAX=446바이트). 호출부는 분할을 신경 쓰지 않는다. */
 esp_err_t can_transport_send(uint8_t priority, uint8_t op_code,
-                             uint8_t dst, const uint8_t *data, uint8_t len);
+                             uint8_t dst, const uint8_t *data, uint16_t len);
 
 /* edge central(ECF=1)이 CAN 멤버를 기다리기 시작한다(기획서 7.4-4 [CMF=1 멤버]).
  *

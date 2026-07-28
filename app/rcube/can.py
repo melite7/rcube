@@ -69,6 +69,88 @@ def _can_id_fields(arb_id: int):
     )
 
 
+# ---- 멀티프레임 (확장 규격 §5) — 펌웨어 can_transport.c와 동일 규격 ----
+SEG_FIRST = 0x80
+SEG_LAST = 0x40
+SEG_INDEX_MASK = 0x3F
+SEG_MAX_INDEX = 0x3F
+SEG_FIRST_DATA = 5      # FIRST 세그먼트가 싣는 실데이터(헤더1 + 길이2 = 3바이트 소비)
+SEG_DATA = 7
+REASSEMBLY_MAX = SEG_FIRST_DATA + SEG_MAX_INDEX * SEG_DATA   # 446
+REASSEMBLY_TIMEOUT = 0.2   # 초
+
+
+def split_multiframe(payload: bytes) -> list[bytes]:
+    """페이로드를 §5 세그먼트 목록으로 나눈다.
+
+    FIRST : [hdr][전체길이 BE16][데이터 5B]
+    이후   : [hdr][데이터 7B]
+    hdr    : bit7=FIRST, bit6=LAST, bit5:0=순번
+    """
+    n = len(payload)
+    if n > REASSEMBLY_MAX:
+        raise ValueError(f"payload {n}B > 멀티프레임 최대 {REASSEMBLY_MAX}B")
+    segs = []
+    chunk = min(SEG_FIRST_DATA, n)
+    last = chunk >= n
+    hdr = SEG_FIRST | (SEG_LAST if last else 0) | 0
+    segs.append(bytes((hdr, (n >> 8) & 0xFF, n & 0xFF)) + payload[:chunk])
+    sent = chunk
+    index = 0
+    while sent < n:
+        index += 1
+        if index > SEG_MAX_INDEX:
+            raise ValueError("세그먼트 순번 초과")
+        chunk = min(SEG_DATA, n - sent)
+        last = (sent + chunk) >= n
+        segs.append(bytes(((SEG_LAST if last else 0) | index,)) + payload[sent:sent + chunk])
+        sent += chunk
+    return segs
+
+
+class Reassembler:
+    """(src, op)별 멀티프레임 재조립. 순번 불일치·타임아웃이면 통째로 버린다."""
+
+    def __init__(self):
+        self._st = {}   # (src, op) → dict
+
+    def expire(self, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        for key in [k for k, v in self._st.items() if now - v["t"] > REASSEMBLY_TIMEOUT]:
+            del self._st[key]
+
+    def feed(self, src: int, op: int, data: bytes) -> Optional[bytes]:
+        """세그먼트 1개 투입. 완성되면 페이로드, 아니면 None."""
+        if not data:
+            return None
+        hdr = data[0]
+        index = hdr & SEG_INDEX_MASK
+        key = (src, op)
+
+        if hdr & SEG_FIRST:
+            if len(data) < 3:
+                return None
+            total = (data[1] << 8) | data[2]
+            if total == 0 or total > REASSEMBLY_MAX:
+                return None
+            self._st[key] = {"total": total, "buf": bytearray(data[3:3 + total]),
+                             "next": 1, "t": time.monotonic()}
+        else:
+            st = self._st.get(key)
+            if st is None or index != st["next"]:
+                self._st.pop(key, None)   # FIRST 누락 또는 순번 어긋남 → 폐기
+                return None
+            st["buf"] += data[1:1 + (st["total"] - len(st["buf"]))]
+            st["next"] += 1
+
+        if not (hdr & SEG_LAST):
+            return None
+        st = self._st.pop(key, None)
+        if st is None or len(st["buf"]) != st["total"]:
+            return None
+        return bytes(st["buf"])
+
+
 class RCubeCAN:
     """USB-CAN 어댑터를 통한 R큐브 CAN 버스 접속(1개)."""
 
@@ -86,6 +168,7 @@ class RCubeCAN:
         self._stop = threading.Event()
         self._nodes: set[int] = set()
         self._lock = threading.Lock()
+        self._reasm = Reassembler()   # 멀티프레임 재조립(확장 규격 §5)
 
     @property
     def is_connected(self) -> bool:
@@ -133,19 +216,28 @@ class RCubeCAN:
 
     # ---- 송신 ----
     def send(self, frame: bytes, *, priority: Optional[int] = None) -> None:
-        """표준 프레임(bytes)을 CAN으로 송신. target=dst, op/payload는 프레임에서 추출."""
+        """표준 프레임(bytes)을 CAN으로 송신. target=dst, op/payload는 프레임에서 추출.
+
+        payload가 8바이트를 넘으면 확장 규격 §5 멀티프레임(MULTI=1)으로 분할한다.
+        """
         if self._bus is None:
             raise RuntimeError("CAN 버스가 열려 있지 않습니다.")
         fr = parse_frame(frame)
         pri = default_priority(fr.op_code) if priority is None else priority
-        if len(fr.payload) > 8:
-            # Classic CAN 데이터필드는 8바이트 — 초과분은 멀티프레임 필요(미구현).
-            raise ValueError(f"payload {len(fr.payload)}B > 8B (CAN 멀티프레임 미지원)")
-        arb = can_id(pri, fr.op_code, 0, 0, CAN_SRC_MASTER, fr.target_id)
-        msg = can.Message(arbitration_id=arb, is_extended_id=True, data=bytes(fr.payload))
-        self._bus.send(msg)
+        payload = bytes(fr.payload)
+
+        if len(payload) <= 8:
+            arb = can_id(pri, fr.op_code, 0, 0, CAN_SRC_MASTER, fr.target_id)
+            self._bus.send(can.Message(arbitration_id=arb, is_extended_id=True, data=payload))
+            self._log(f"TX  can id=0x{arb:08X} op={fr.op_name} dst=0x{fr.target_id:02X} "
+                      f"[{payload.hex(' ').upper() if payload else '-'}]")
+            return
+
+        arb = can_id(pri, fr.op_code, 1, 0, CAN_SRC_MASTER, fr.target_id)
+        for seg in split_multiframe(payload):
+            self._bus.send(can.Message(arbitration_id=arb, is_extended_id=True, data=seg))
         self._log(f"TX  can id=0x{arb:08X} op={fr.op_name} dst=0x{fr.target_id:02X} "
-                  f"[{fr.payload.hex(' ').upper() if fr.payload else '-'}]")
+                  f"멀티프레임 {len(payload)}B → {len(split_multiframe(payload))}세그먼트")
 
     # ---- 노드 검색(하트비트/부팅 수집) ----
     def discover(self, timeout: float = 2.0) -> list[int]:
@@ -191,6 +283,13 @@ class RCubeCAN:
             if op in (int(OpCode.Heartbeat), int(OpCode.NodeAnnounce)):
                 with self._lock:
                     self._nodes.add(src)
+
+            if multi:
+                # MULTI=1 → 세그먼트. 다 모여야 상위로 올린다(확장 규격 §5).
+                self._reasm.expire()
+                data = self._reasm.feed(src, op, data)
+                if data is None:
+                    continue
 
             # 표준프레임 [Src][Op][PacketSize BE][data] 로 재구성해 상위로.
             total = HEADER_LEN + len(data)
