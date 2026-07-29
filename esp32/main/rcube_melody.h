@@ -38,21 +38,30 @@ typedef enum {
     RCUBE_MELODY_LINK_COMPLETED,   /* 전체 연결 완료(유닛구성완료) */
     RCUBE_MELODY_LINK_WAIT,        /* 연결모드 진입(연결대기) — 기획서 5장 [소리 규칙] */
     RCUBE_MELODY_EDGE,             /* 연결모드 진입(edge central 전용 엣지 멜로디) */
-    /* 노드ID 부팅음: ID1=C4, ID2=D4 … ID8=C5 를 0.5s 연주·0.5s 쉼·0.5s 연주.
-     * 반드시 연속(NODE_1..NODE_8)이어야 한다 — rcube_melody_node_id()가 오프셋으로 쓴다. */
-    RCUBE_MELODY_NODE_1,
-    RCUBE_MELODY_NODE_2,
-    RCUBE_MELODY_NODE_3,
-    RCUBE_MELODY_NODE_4,
-    RCUBE_MELODY_NODE_5,
-    RCUBE_MELODY_NODE_6,
-    RCUBE_MELODY_NODE_7,
-    RCUBE_MELODY_NODE_8,
+    /* 그룹번호 알림. 음이 런타임(그룹번호)에 따라 정해지므로 고정 테이블이 없고,
+     * rcube_melody_group_notes()로 그때그때 만든다. rcube_melody()는 NULL을 준다. */
+    RCUBE_MELODY_GROUP,
     RCUBE_MELODY_COUNT
 } rcube_melody_id_t;
 
-/* id에 해당하는 멜로디를 돌려준다. 범위를 벗어나면 NULL. */
+/* id에 해당하는 멜로디를 돌려준다. 범위를 벗어나거나 GROUP이면 NULL. */
 const rcube_melody_t *rcube_melody(rcube_melody_id_t id);
 
-/* 부팅음 선택: 노드ID(1~8)가 있으면 그 노드 멜로디, 0/범위밖이면 START. */
-rcube_melody_id_t rcube_melody_node_id(uint8_t node_id);
+/* ---- 그룹번호 알림음 (기획서 5장 [소리 규칙], 2026-07-29 재정의) --------
+ * 그룹 LED 색상표와 같은 자릿수를 음으로 옮긴다.
+ *   0 흰색 C4 · 1 Red D4 · 2 Green E4 · 3 Blue F4 · 4 Cyan G4
+ *   5 Magenta A4 · 6 Yellow B4 · 7 Violet C5 · 8 Orange D5 · 9 연한Red E5
+ * 즉 piano_scale 인덱스 = 자릿수 + 2.
+ *
+ * ※ 노드ID는 소리에 반영하지 않는다 — 노드ID는 ID 표시용 칼라 LED 전용이다.
+ *   같은 값을 소리와 LED로 이중 표시하면 한쪽만 바뀌었을 때 어긋나기 때문이다. */
+#define RCUBE_GROUP_NOTE_HI_MS 200   /* 십의 자리 */
+#define RCUBE_GROUP_NOTE_LO_MS 600   /* 일의 자리 */
+#define RCUBE_GROUP_NOTE_COUNT 2
+
+/* 색 자릿수(0~9) → piano_scale 인덱스. */
+uint8_t rcube_melody_digit_note(uint8_t digit);
+
+/* 그룹번호(0~99)를 두 음으로 전개한다. buf는 최소 RCUBE_GROUP_NOTE_COUNT칸.
+ * 만든 음 개수를 반환(공간이 모자라면 0). */
+uint8_t rcube_melody_group_notes(uint8_t group_id, rcube_note_t *buf, uint8_t cap);

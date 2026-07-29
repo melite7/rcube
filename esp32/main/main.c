@@ -160,7 +160,15 @@ static void button_task(void *arg)
         if (prev == 1 && level == 0) {          /* 하강 에지 = 눌림 시작 */
             vTaskDelay(pdMS_TO_TICKS(20));       /* 디바운스 */
             if (gpio_get_level(BOOT_BTN_GPIO) == 0) {
-                rcube_buzzer_play(RCUBE_MELODY_BUTTON_PRESSED);
+                /* 기획서 5장 [소리 규칙](2026-07-29): 그룹번호가 배정돼 있으면 버튼음
+                 * 대신 그룹번호 두 자리를 음으로 알린다. 사용자가 BLE 연결 혼선을
+                 * 막으려면 그룹을 귀로도 확인할 수 있어야 하기 때문이다. */
+                uint8_t group = rcube_config_group_id();
+                if (group == 0) {
+                    rcube_buzzer_play(RCUBE_MELODY_BUTTON_PRESSED);
+                } else {
+                    rcube_buzzer_play_group(group);
+                }
                 /* 누른 채 hold 시간 측정. 3초 도달 순간 설정모드로 전환. */
                 uint32_t held = 0;
                 bool config_triggered = false;
@@ -236,15 +244,18 @@ void app_main(void)
     ble_rcube_init();
     log_heap("2 NimBLE(최대8연결)");
 
-    /* 부팅 성공: 상태 LED 태스크 기동 + 부팅음.
-     * 기획서 5장 [소리 규칙]: 노드ID가 있으면 자기 멜로디(ID1 C4, ID2 D4 …)를
-     * 2번, 없으면(비고정형) 디폴트 켜짐 멜로디를 연주한다. */
+    /* 부팅 성공: 상태 LED 태스크 기동 + 부팅음(START 1회).
+     *
+     * 기획서 5장 [소리 규칙](2026-07-29 재정의): 노드ID와 무관하게 START를 1회 연주한다.
+     * 노드ID는 소리에 반영하지 않고 ID 표시용 칼라 LED로만 나타낸다 — 같은 값을 두
+     * 경로로 이중 표시하면 한쪽 규칙만 바뀌었을 때 서로 어긋나기 때문이다.
+     *
+     * START는 xlsx '멜로디 데이터' 시트 그대로 B3(247Hz) 0.5s → D4(294Hz) 0.5s →
+     * B4(494Hz) 1.0s, 총 2초다. */
     rcube_status_start();
-    rcube_melody_id_t boot_melody = rcube_melody_node_id(rcube_config_node_id());
-    rcube_buzzer_play(boot_melody);
-    ESP_LOGI(TAG, "boot OK -> LED(노드ID %s) + %s melody",
-             rcube_config_node_id() ? "색 점멸" : "흰색 점멸(미할당)",
-             rcube_melody(boot_melody)->name);
+    rcube_buzzer_play(RCUBE_MELODY_START);
+    ESP_LOGI(TAG, "boot OK -> LED(노드ID %s) + START melody",
+             rcube_config_node_id() ? "색 점멸" : "흰색 점멸(미할당)");
 
     /* 센서 모니터링(기획서 9장) — 전송은 상위의 B1 명령으로 시작한다. */
     rcube_sensor_init();
