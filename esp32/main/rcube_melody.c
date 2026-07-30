@@ -6,9 +6,20 @@ const uint16_t rcube_piano_scale[RCUBE_PIANO_SCALE_LEN] = {
     523, 587, 659, 698, 784, 880, 988, 1046,
 };
 
-/* ── START (부팅/시작음): B3, D4, B4 ── */
+/* ── START (부팅/시작음): B3, D4, B4 ──
+ * xlsx '멜로디 데이터'는 0.5 / 0.5 / 1.0초(총 2초)인데, 재생 속도를 2배로 하라는
+ * 요청(2026-07-30)에 따라 길이를 절반으로 줄였다(총 1초). 음과 순서는 그대로다.
+ * ★ 따라서 이 항목은 xlsx와 의도적으로 다르다 — 대조 스크립트가 START를 불일치로
+ *   표시하는 것이 정상이다. */
 static const rcube_note_t START_NOTES[] = {
-    {1, 500}, {3, 500}, {8, 1000},
+    {1, 250}, {3, 250}, {8, 500},
+};
+
+/* ── DISCONNECT (BLE 연결 끊김): START를 역순으로 ──
+ * 연결됨(상행 B3→D4→B4)과 끊김(하행 B4→D4→B3)이 귀로 바로 구분된다.
+ * 세 음 모두 0.25초로 균등하게 둔다(2026-07-30) — 끝음을 늘이지 않아 짧고 단호하다. */
+static const rcube_note_t DISCONNECT_NOTES[] = {
+    {8, 250}, {3, 250}, {1, 250},
 };
 
 /* ── BUTTON_PRESSED (버튼 눌림): E4, C4, F4, C4 ── */
@@ -50,6 +61,7 @@ static const rcube_melody_t MELODIES[RCUBE_MELODY_COUNT] = {
     [RCUBE_MELODY_LINK_COMPLETED] = MELODY(LINK_COMPLETED_NOTES, "LINKCOMPLETED"),
     [RCUBE_MELODY_LINK_WAIT]      = MELODY(LINK_WAIT_NOTES, "LINKWAIT"),
     [RCUBE_MELODY_EDGE]           = MELODY(EDGE_NOTES, "EDGE"),
+    [RCUBE_MELODY_DISCONNECT]     = MELODY(DISCONNECT_NOTES, "DISCONNECT"),
     /* RCUBE_MELODY_GROUP은 런타임 생성이라 테이블이 비어 있다(notes=NULL). */
 };
 

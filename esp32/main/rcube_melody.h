@@ -38,6 +38,7 @@ typedef enum {
     RCUBE_MELODY_LINK_COMPLETED,   /* 전체 연결 완료(유닛구성완료) */
     RCUBE_MELODY_LINK_WAIT,        /* 연결모드 진입(연결대기) — 기획서 5장 [소리 규칙] */
     RCUBE_MELODY_EDGE,             /* 연결모드 진입(edge central 전용 엣지 멜로디) */
+    RCUBE_MELODY_DISCONNECT,       /* BLE 연결 끊김 — START를 역순으로(하행) */
     /* 그룹번호 알림. 음이 런타임(그룹번호)에 따라 정해지므로 고정 테이블이 없고,
      * rcube_melody_group_notes()로 그때그때 만든다. rcube_melody()는 NULL을 준다. */
     RCUBE_MELODY_GROUP,

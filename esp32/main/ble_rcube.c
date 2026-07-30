@@ -4,6 +4,7 @@
 #include "ble_multirole.h"
 #include "rcube_config.h"
 #include "rcube_status.h"
+#include "rcube_buzzer.h"
 
 #include <stdio.h>
 
@@ -245,6 +246,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnected; reason=%d", event->disconnect.reason);
+        /* 기획서 5장 [소리 규칙](2026-07-30): 연결이 끊기면 START를 역순으로 연주해
+         * 사용자가 붙었는지 떨어졌는지 귀로 구분할 수 있게 한다. */
+        rcube_buzzer_play(RCUBE_MELODY_DISCONNECT);
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_connected = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;

@@ -22,8 +22,32 @@ static const char *TAG = "buz";
 #define BUZZER_DUTY_RES     RCUBE_LEDC_BUZZER_RES     /* 0~1023 */
 #define BUZZER_DUTY_MAX     ((1u << 10) - 1u)
 
-/* 내장 멜로디 진폭 0.9 고정 → 사각파 duty = 진폭*50%. */
+/* ★ 부저 구동 극성 — Active-LOW (회로도 확인, 2026-07-30)
+ *
+ *   CONTROL_BUZZ ──[R13 1K]── B│ Q3 (PNP)
+ *                             E├── VCC5_33_BUZZ
+ *                             C├── BUZZER U6 ── GND_BUZZ
+ *
+ * PNP는 베이스가 이미터보다 낮을 때 도통한다. 따라서
+ *   LOW  = Q3 ON  = 소리
+ *   HIGH = Q3 OFF = 무음
+ * 무음을 LOW로 두면 부저가 계속 켜져 발열한다(실제로 그랬다).
+ *
+ * 고임피던스도 쓰면 안 된다: 베이스에 풀업이 없어 플로팅되면 Q3가 선형 영역에
+ * 걸려 스스로 전력을 태운다. 무음은 반드시 HIGH로 "확실히 끈다".
+ *
+ * ⚠️ VCC5_33_BUZZ는 반드시 3.3V여야 한다. 5V면 GPIO를 HIGH(3.3V)로 올려도
+ *    V_EB = 5 - 3.3 = 1.7V로 여전히 도통해 부저가 꺼지지 않는다. */
+#define BUZZER_ACTIVE_LOW   1
+
+/* 내장 멜로디 진폭 0.9 고정(큐브_멜로디_데이터.xlsx '개요': 전 곡 0.9). */
 #define BUZZER_AMPLITUDE    0.9f
+
+/* 전역 음량 0~100(%). 사각파 ON 비율을 줄여 부저에 실리는 에너지를 낮춘다.
+ * 100이면 ON≈45%(진폭 0.9 × 최대 50%)로 가장 크고, 낮추면 짧은 펄스가 되어 조용해진다.
+ * 음높이(주파수)는 그대로이므로 음정은 변하지 않는다.
+ * 더 줄이려면 이 값만 낮추면 된다. 하드웨어로 더 줄이려면 부저에 직렬 저항을 넣는다. */
+#define BUZZER_VOLUME_DEFAULT 4
 /* 음 사이 짧은 무음(반복음 분리용). */
 #define INTER_NOTE_GAP_MS   6
 
@@ -36,9 +60,42 @@ typedef struct {
 static QueueHandle_t s_queue;
 static bool s_ready;
 
+static uint8_t s_volume = BUZZER_VOLUME_DEFAULT;
+
+/* 원하는 "ON 시간" 틱수. 사각파 최대는 50%이고, 거기에 멜로디 진폭과 음량을 곱한다. */
 static uint32_t tone_duty(void)
 {
-    return (uint32_t)(BUZZER_AMPLITUDE * (float)(BUZZER_DUTY_MAX / 2));
+    uint32_t half = (BUZZER_DUTY_MAX + 1u) / 2u;   /* 512 = 50% */
+    uint32_t on = (uint32_t)((float)half * BUZZER_AMPLITUDE * (s_volume / 100.0f));
+    if (on == 0 && s_volume > 0) {
+        on = 1;   /* 음량이 아주 낮아도 완전 무음이 되지 않게 최소 1틱 */
+    }
+    return on;
+}
+
+void rcube_buzzer_set_volume(uint8_t percent)
+{
+    s_volume = (percent > 100) ? 100 : percent;
+    ESP_LOGI(TAG, "음량 %u%% (ON 비율 ≈ %.1f%%)", s_volume,
+             100.0f * (float)tone_duty() / (float)(BUZZER_DUTY_MAX + 1u));
+}
+
+uint8_t rcube_buzzer_volume(void) { return s_volume; }
+
+/* 무음: Q3를 확실히 끄는 레벨로 고정한다(Active-LOW이므로 HIGH). */
+#define BUZZER_IDLE_LEVEL (BUZZER_ACTIVE_LOW ? 1u : 0u)
+
+/* 소리 낼 때 채널에 넣을 duty. LEDC duty는 "HIGH 시간"이라, Active-LOW에서는
+ * 원하는 ON 비율(≈45%)만큼 LOW로 있어야 하므로 반전시킨다. */
+static uint32_t tone_duty_wire(void)
+{
+    uint32_t on = tone_duty();
+    return BUZZER_ACTIVE_LOW ? ((BUZZER_DUTY_MAX + 1u) - on) : on;
+}
+
+static void pin_silence(void)
+{
+    ledc_stop(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, BUZZER_IDLE_LEVEL);
 }
 
 void rcube_buzzer_tone(uint16_t freq_hz)
@@ -47,13 +104,11 @@ void rcube_buzzer_tone(uint16_t freq_hz)
         return;
     }
     if (freq_hz == 0) {
-        /* duty만 0으로 두면 채널이 살아 있어, 타이머 주파수가 그대로 걸린 상태가 된다.
-         * ledc_stop으로 신호 생성 자체를 멈추고 출력을 LOW로 고정한다(무음 보장). */
-        ledc_stop(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0 /* idle level = LOW */);
+        pin_silence();
         return;
     }
     ledc_set_freq(BUZZER_LEDC_MODE, BUZZER_LEDC_TIMER, freq_hz);
-    ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, tone_duty());
+    ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, tone_duty_wire());
     ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 }
 
@@ -120,7 +175,9 @@ void rcube_buzzer_init(void)
         .speed_mode = BUZZER_LEDC_MODE,
         .channel    = BUZZER_LEDC_CHANNEL,
         .timer_sel  = BUZZER_LEDC_TIMER,
-        .duty       = 0,                        /* 기본 무음 */
+        /* Active-LOW이므로 duty 0(=계속 LOW)은 "부저 ON"이다. 초기값부터 무음
+         * 레벨로 잡아, 설정과 pin_silence() 사이의 짧은 구간에도 소리가 나지 않게 한다. */
+        .duty       = BUZZER_ACTIVE_LOW ? (BUZZER_DUTY_MAX + 1u) : 0u,
         .hpoint     = 0,
     };
     err = ledc_channel_config(&ch);
@@ -140,11 +197,13 @@ void rcube_buzzer_init(void)
         return;
     }
     s_ready = true;
-    /* 부팅 직후 무음 보장. 채널 설정만으로도 duty 0이지만, 신호 생성을 명시적으로
-     * 멈춰 두어야 잔음이 남지 않는다. */
-    ledc_stop(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
-    ESP_LOGI(TAG, "buzzer ready on GPIO %d (LEDC timer%d ch%d, 무음 상태)",
-             BUZZER_GPIO, (int)BUZZER_LEDC_TIMER, (int)BUZZER_LEDC_CHANNEL);
+    pin_silence();   /* Q3를 확실히 끈 상태로 시작 */
+    ESP_LOGI(TAG, "buzzer ready on GPIO %d (LEDC timer%d ch%d, Active-%s, 무음=%s, "
+                  "음량 %u%% → ON 비율 %.1f%%)",
+             BUZZER_GPIO, (int)BUZZER_LEDC_TIMER, (int)BUZZER_LEDC_CHANNEL,
+             BUZZER_ACTIVE_LOW ? "LOW(PNP)" : "HIGH",
+             BUZZER_IDLE_LEVEL ? "HIGH" : "LOW",
+             s_volume, 100.0f * (float)tone_duty() / (float)(BUZZER_DUTY_MAX + 1u));
 }
 
 static void enqueue(rcube_melody_id_t id, uint8_t arg)
