@@ -2,7 +2,7 @@
 rcube_protocol.py
 ★ 자동 생성 파일 — 직접 수정 금지.
   원본: docs/R큐브_프로토콜_BLE_CAN__20260703.xlsx + R큐브_프로토콜_확장_20260728.md
-  생성: tools/gen_protocol.py  (2026-07-28)
+  생성: tools/gen_protocol.py  (2026-07-29)
 """
 from enum import IntEnum
 
@@ -69,6 +69,7 @@ class OpCode(IntEnum):
     GetExtPortMode = 0xB5
     GetPosition = 0xB6
     MotionComplete = 0xB7
+    MissionControl = 0xF9
 
 
 class ResultCode(IntEnum):

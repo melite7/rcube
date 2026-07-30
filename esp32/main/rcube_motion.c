@@ -2,6 +2,7 @@
 #include "motion_core.h"
 #include "motor_uart.h"
 #include "rcube_cmd.h"
+#include "rcube_params.h"
 
 #include <string.h>
 
@@ -36,6 +37,19 @@ static void wr_i16(uint8_t *p, int16_t v)
     p[0] = (uint8_t)((v >> 8) & 0xFF); p[1] = (uint8_t)(v & 0xFF);
 }
 
+/* ★ 3단 안전 1단(기획서 8장): 각도 소프트리밋 밖 목표는 큐브가 거부한다.
+ * 상위가 잘못 계산한 목표로 기구를 밀어붙이는 것을 여기서 끊는다. */
+static bool angle_ok(int32_t position)
+{
+    if (rcube_params_angle_ok(position)) {
+        return true;
+    }
+    const rcube_params_t *p = rcube_params();
+    ESP_LOGE(TAG, "각도 소프트리밋 위반: 목표 %.2f° (허용 %.2f~%.2f°) → 거부",
+             position / 100.0f, p->angle_min / 100.0f, p->angle_max / 100.0f);
+    return false;
+}
+
 static bool push_one(int32_t position, uint16_t t_ms, int16_t velocity, uint8_t mode)
 {
     motion_waypoint_t wp = {
@@ -56,6 +70,7 @@ static uint8_t handle_single_angle(const uint8_t *p, uint16_t len)
     uint8_t mode = p[0];
     int32_t pos = rd_i32(&p[1]);
     uint16_t t_ms = rd_u16(&p[5]);
+    if (!angle_ok(pos)) return RCUBE_RC_ANGLE_LIMIT;
     if (!push_one(pos, t_ms, 0, mode)) return RCUBE_RC_BUFFER_FULL;
     ESP_LOGI(TAG, "C1 SetSingleAngle: %.2f° in %u ms (%s)",
              pos / 100.0f, t_ms, mode ? "Buffered" : "Immediate");
@@ -93,6 +108,9 @@ static uint8_t handle_scheduled(const uint8_t *p, uint16_t len)
     uint8_t pushed = 0;
     for (uint8_t i = 0; i < count; i++) {
         const uint8_t *w = &p[4 + i * WP_WIRE_LEN];
+        if (!angle_ok(rd_i32(&w[4]))) {
+            return RCUBE_RC_ANGLE_LIMIT;   /* 한 점이라도 밖이면 묶음 전체를 거부 */
+        }
         motion_waypoint_t wp = {
             .t_offset_us = (uint32_t)rd_i32(w),
             .position = rd_i32(&w[4]),
@@ -157,6 +175,36 @@ static uint8_t handle_drive_state(const uint8_t *p, uint16_t len)
     }
     ESP_LOGI(TAG, "CB SetDriveState: state=0x%02x (게이트 %s)",
              p[0], motor_uart_gate_enabled() ? "ON" : "OFF");
+    return RCUBE_RC_OK;
+}
+
+/* ---- 파라미터·리밋 (확장 규격 §2.12) ---------------------------------
+ * 적용은 즉시, NVS 저장은 DB(SaveParameters)를 받아야 한다. 튜닝 중 잘못된 값을
+ * 저장해 다음 부팅부터 못 쓰게 되는 상황을 막기 위해 둘을 분리한다. */
+
+static uint8_t handle_angle_limits(const uint8_t *p, uint16_t len)
+{
+    if (len < 8) return RCUBE_RC_BAD_LENGTH;
+    int32_t lo = rd_i32(&p[0]), hi = rd_i32(&p[4]);
+    if (!(lo == 0 && hi == 0) && lo >= hi) {
+        ESP_LOGW(TAG, "D8: min(%.2f) >= max(%.2f)", lo / 100.0f, hi / 100.0f);
+        return RCUBE_RC_BAD_PARAM;
+    }
+    rcube_params_set_angle_limits(lo, hi);
+    return RCUBE_RC_OK;
+}
+
+static uint8_t handle_motion_limits(const uint8_t *p, uint16_t len)
+{
+    if (len < 6) return RCUBE_RC_BAD_LENGTH;
+    rcube_params_set_motion_limits(rd_u16(&p[0]), rd_u16(&p[2]), rd_u16(&p[4]));
+    return RCUBE_RC_OK;
+}
+
+static uint8_t handle_fault_thresholds(const uint8_t *p, uint16_t len)
+{
+    if (len < 5) return RCUBE_RC_BAD_LENGTH;
+    rcube_params_set_fault_thresholds(rd_u16(&p[0]), rd_u16(&p[2]), p[4]);
     return RCUBE_RC_OK;
 }
 
@@ -269,6 +317,13 @@ bool rcube_motion_handle(uint8_t op, const uint8_t *payload, uint16_t plen, uint
     case RCUBE_OP_SetScheduledAngles: rc = handle_scheduled(payload, plen); break;
     case RCUBE_OP_ExecuteBuffer:      rc = handle_execute(payload, plen); break;
     case RCUBE_OP_TimeSync:           rc = handle_timesync(payload, plen); break;
+    case RCUBE_OP_SetAngleLimits:     rc = handle_angle_limits(payload, plen); break;
+    case RCUBE_OP_SetMotionLimits:    rc = handle_motion_limits(payload, plen); break;
+    case RCUBE_OP_SetFaultThresholds: rc = handle_fault_thresholds(payload, plen); break;
+
+    case RCUBE_OP_SaveParameters:
+        rc = (rcube_params_save() == ESP_OK) ? RCUBE_RC_OK : RCUBE_RC_FLASH_FAIL;
+        break;
     case RCUBE_OP_MoveToOrigin:       rc = handle_move_origin(payload, plen); break;
     case RCUBE_OP_SetDriveState:      rc = handle_drive_state(payload, plen); break;
 

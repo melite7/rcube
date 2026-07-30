@@ -3,14 +3,14 @@
  * ----------------------------------------------------------------
  * ★ 자동 생성 파일 — 직접 수정 금지.
  *   원본: docs/R큐브_프로토콜_BLE_CAN__20260703.xlsx + R큐브_프로토콜_확장_20260728.md
- *   생성: tools/gen_protocol.py  (2026-07-28)
+ *   생성: tools/gen_protocol.py  (2026-07-29)
  *   수정이 필요하면 xlsx를 고치고 생성기를 다시 실행하세요.
  * ----------------------------------------------------------------
  */
 #pragma once
 #include <stdint.h>
 
-/* 총 61 명령 (BLE/CAN 응용계층 공유) */
+/* 총 62 명령 (BLE/CAN 응용계층 공유) */
 typedef enum {
     RCUBE_OP_CmdAck                     = 0xAF,  /* APPENDIX-Response */
     RCUBE_OP_NodeAnnounce               = 0xD9,  /* CAN-Discovery */
@@ -73,4 +73,5 @@ typedef enum {
     RCUBE_OP_GetExtPortMode             = 0xB5,  /* SENSOR-Sensor */
     RCUBE_OP_GetPosition                = 0xB6,  /* SENSOR-Sensor */
     RCUBE_OP_MotionComplete             = 0xB7,  /* CONTROL-Motion */
+    RCUBE_OP_MissionControl             = 0xF9,  /* CONFIG-Mission/OTA */
 } rcube_opcode_t;

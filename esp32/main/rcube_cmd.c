@@ -3,6 +3,8 @@
 #include "rcube_status.h"
 #include "rcube_sensor.h"
 #include "rcube_motion.h"
+#include "rcube_mission.h"
+#include "ble_multirole.h"
 #include "board_led.h"
 
 #include <string.h>
@@ -104,8 +106,8 @@ static uint8_t handle_set_led(const uint8_t *p, uint16_t len)
  * 멤버가 붙을 때마다 멀티롤 레이어가 rcube_cmd_report_members()로 0xA1을 보낸다.
  *
  * 허브 LED(기획서 5장 [ID 표시용 칼라LED 점등 규칙] · 7.2-7):
- *   - 비고정형 초기구성(노드ID 미할당) → 가상1 = Red
- *   - 고정형 재연결(노드ID 저장됨)     → 자기 저장 노드ID 색 (무조건 빨강 아님)
+ *   - 비고정형 초기구성 → 가상1 = Red (저장 노드ID와 무관하다)
+ *   - 고정형 재연결     → 자기 저장 노드ID 색 (무조건 빨강 아님)
  *   두 경우 모두 담당 멤버가 전원 연결되기 전엔 점멸(HUB_WAIT), 완료 시 상시 점등. */
 static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
 {
@@ -114,22 +116,27 @@ static uint8_t handle_set_aggregator(const uint8_t *p, uint16_t len)
     }
     uint8_t link_count = p[0];
     uint8_t group_mode = p[1];
+    uint8_t flags = (len >= 3) ? p[2] : 0;
+    bool ordered = (flags & RCUBE_AGG_FLAG_ORDERED) != 0;
 
+    /* ★ 색도 절차를 따른다. 자기 노드ID로 고르면, 비고정형 재구성에서 노드5 큐브가
+     * 허브가 됐을 때 가상1(Red)이 아니라 Magenta로 켜져 순서 표시가 깨진다. */
     uint8_t node_id = rcube_config_node_id();
     uint8_t r, g, b;
-    if (node_id != 0) {
+    if (ordered) {
         rcube_status_node_color(node_id, &r, &g, &b);   /* 고정형: 자기 노드ID 색 */
     } else {
         r = 255; g = 0; b = 0;                          /* 비고정형: 가상1 = Red */
     }
     rcube_status_set_color(r, g, b);
     rcube_status_set_mode(RCUBE_LED_HUB_WAIT);
-    ESP_LOGI(TAG, "SetMultiroleAggregator: total=%u, group_mode=0x%02x → BLE 허브 승격 "
-                  "(node=0x%02x, %s, 멤버 대기 점멸)",
-             link_count, group_mode, node_id, node_id ? "고정형/노드색" : "비고정형/Red");
+    ESP_LOGI(TAG, "SetMultiroleAggregator: total=%u, group_mode=0x%02x, flags=0x%02x → "
+                  "BLE 허브 승격 (저장 node=0x%02x, %s, 멤버 대기 점멸)",
+             link_count, group_mode, flags, node_id,
+             ordered ? "고정형/노드색" : "비고정형/가상1=Red");
 
     if (s_ops.agg_start != NULL) {
-        s_ops.agg_start(link_count, group_mode);   /* 멤버 스캔·연결 시작(비동기) */
+        s_ops.agg_start(link_count, group_mode, flags);   /* 멤버 스캔·연결 시작(비동기) */
     } else {
         ESP_LOGW(TAG, "agg_start 미등록 → 멤버 연결 불가, 0xA1(0)만 회신");
         rcube_cmd_report_members(0);
@@ -444,6 +451,54 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
             s_ops.forward_all(data, len);   /* 전 멤버도 초기화 */
         }
         rc = handle_reset_config();
+        reply_cmd_ack(op, rc);
+        break;
+
+    /* ---- 미션코드 (확장 규격 §2.5) ---- */
+    case RCUBE_OP_MissionUploadBegin:
+        if (plen < 13) { rc = RCUBE_RC_BAD_LENGTH; }
+        else {
+            rc = rcube_mission_begin(payload[0],
+                                     ((uint32_t)payload[1] << 24) | ((uint32_t)payload[2] << 16) |
+                                     ((uint32_t)payload[3] << 8) | payload[4],
+                                     ((uint32_t)payload[5] << 24) | ((uint32_t)payload[6] << 16) |
+                                     ((uint32_t)payload[7] << 8) | payload[8],
+                                     ((uint32_t)payload[9] << 24) | ((uint32_t)payload[10] << 16) |
+                                     ((uint32_t)payload[11] << 8) | payload[12]);
+        }
+        reply_cmd_ack(op, rc);
+        break;
+
+    case RCUBE_OP_MissionUploadChunk:
+        if (plen < 3) { rc = RCUBE_RC_BAD_LENGTH; }
+        else {
+            rc = rcube_mission_chunk((uint16_t)((payload[0] << 8) | payload[1]),
+                                     &payload[2], (uint16_t)(plen - 2));
+        }
+        reply_cmd_ack(op, rc);
+        break;
+
+    case RCUBE_OP_MissionUploadCommit:
+        reply_cmd_ack(op, rcube_mission_commit());
+        break;
+
+    case RCUBE_OP_GetMissionInfo: {
+        uint8_t f[HEADER_LEN + 1 + RCUBE_MISSION_HDR_LEN];
+        uint8_t n = rcube_mission_info(&f[4], sizeof(f) - HEADER_LEN);
+        if (n > 0 && s_ops.send != NULL) {
+            uint16_t total = (uint16_t)(HEADER_LEN + n);
+            put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_GetMissionInfo, total);
+            s_ops.send(f, total);   /* 회신이 곧 응답 */
+        }
+        break;
+    }
+
+    case RCUBE_OP_DeleteMission:
+        reply_cmd_ack(op, rcube_mission_delete());
+        break;
+
+    case RCUBE_OP_MissionControl:
+        rc = (plen >= 1) ? rcube_mission_control(payload[0]) : RCUBE_RC_BAD_LENGTH;
         reply_cmd_ack(op, rc);
         break;
 

@@ -28,7 +28,8 @@ typedef int (*rcube_send_fn)(const uint8_t *frame, uint16_t len);
 /* 명령 레이어가 전송계층에 위임하는 동작들. NULL이면 해당 기능 미지원. */
 typedef struct {
     rcube_send_fn send;                                  /* PC로 프레임 회신 */
-    void (*agg_start)(uint8_t link_count, uint8_t group_mode); /* BLE 허브 승격 */
+    /* BLE 허브 승격. flags bit0 = 연결 절차(0=비고정형/연결순서, 1=고정형/광고 NN). */
+    void (*agg_start)(uint8_t link_count, uint8_t group_mode, uint8_t flags);
     void (*agg_stop)(void);                              /* BLE 허브 해제 */
     int  (*forward)(uint8_t target_id, const uint8_t *frame, uint16_t len); /* 멤버 중계 */
     int  (*forward_all)(const uint8_t *frame, uint16_t len);  /* 전 멤버로 브로드캐스트 중계 */

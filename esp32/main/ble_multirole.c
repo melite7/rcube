@@ -165,7 +165,7 @@ static void scan_if_needed(void)
 }
 
 /* ---- 공개 API -------------------------------------------------------- */
-void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode)
+void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode, uint8_t flags)
 {
     /* 기존 아그리게이터 상태가 있으면 먼저 정리. */
     ble_multirole_stop_aggregator();
@@ -180,14 +180,17 @@ void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode)
     s_edge = false;            /* 서브로봇유닛의 BLE 허브 역할 */
     s_target_members = members;
     s_group_mode = group_mode;
-    /* 기획서 7.5: 노드ID 저장 여부가 곧 고정형 판정(별도 전환 명령 없음). */
-    s_ordered = (rcube_config_node_id() != 0);
+    /* ★ 절차는 PC가 지시한다(확장 규격 §2.2). 허브 자기 노드ID로 판정하면, 이미
+     * 노드ID가 저장된 큐브들로 비고정형 재구성을 할 수 없다 — 노드1 허브가 무조건
+     * 고정형이 되어 멤버가 연결 순서 대신 저장 노드ID를 받아 버린다. */
+    s_ordered = (flags & RCUBE_AGG_FLAG_ORDERED) != 0;
     s_next_vid = 2;            /* 허브=1(0xFE), 멤버는 2부터 */
     s_connect_pending = false;
 
-    ESP_LOGI(TAG, "BLE 허브 시작: 목표 멤버 %u대(group_mode=0x%02x, %s)",
-             members, group_mode,
-             s_ordered ? "고정형=광고 NN 기준" : "비고정형=연결 순서");
+    ESP_LOGI(TAG, "BLE 허브 시작: 목표 멤버 %u대(group_mode=0x%02x, flags=0x%02x, %s)",
+             members, group_mode, flags,
+             s_ordered ? "고정형=광고 NN을 가상ID로"
+                       : "비고정형=연결 순서로 가상ID(저장 노드ID 무시)");
 
     if (members == 0) {
         rcube_cmd_report_members(0);   /* R1 상당 — 멤버 없음 */

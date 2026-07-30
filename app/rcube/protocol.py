@@ -267,6 +267,115 @@ def build_emergency_stop(*, target_id: int = ADDR_BROADCAST) -> bytes:
     return build_frame(target_id, OpCode.EmergencyStop, b"")
 
 
+# ---- 모터 파라미터·리밋 (확장 규격 §2.12) ----
+def build_set_angle_limits(min_deg: float, max_deg: float,
+                           *, target_id: int = ADDR_HUB) -> bytes:
+    """SetAngleLimits(0xD8). [min(int32,0.01°)][max(int32,0.01°)] — 8B.
+
+    둘 다 0이면 리밋 해제. 범위를 벗어나는 목표는 큐브가 ANGLE_LIMIT으로 거부한다
+    (기획서 8장 3단 안전의 1단).
+    """
+    return build_frame(target_id, OpCode.SetAngleLimits,
+                       _i32(round(min_deg * 100)) + _i32(round(max_deg * 100)))
+
+
+def build_set_motion_limits(max_dps: float = 0, max_acc: int = 0, max_jerk: int = 0,
+                            *, target_id: int = ADDR_HUB) -> bytes:
+    """SetMotionLimits(0xCD). [max_vel(u16,0.1°/s)][max_acc(u16)][max_jerk(u16)] — 6B. 0=제한없음."""
+    return build_frame(target_id, OpCode.SetMotionLimits,
+                       round(max_dps * 10).to_bytes(2, "big") +
+                       int(max_acc).to_bytes(2, "big") + int(max_jerk).to_bytes(2, "big"))
+
+
+def build_set_fault_thresholds(follow_err_deg: float = 0, over_current_a: float = 0,
+                               over_temp_c: int = 0, *, target_id: int = ADDR_HUB) -> bytes:
+    """SetFaultThresholds(0xCE). [follow_err(u16,0.01°)][over_current(u16,0.01A)][over_temp(u8)] — 5B."""
+    return build_frame(target_id, OpCode.SetFaultThresholds,
+                       round(follow_err_deg * 100).to_bytes(2, "big") +
+                       round(over_current_a * 100).to_bytes(2, "big") +
+                       bytes((int(over_temp_c) & 0xFF,)))
+
+
+def build_save_parameters(*, target_id: int = ADDR_HUB) -> bytes:
+    """SaveParameters(0xDB). 현재 파라미터를 NVS에 저장. 적용과 저장을 분리해 둔 이유는
+    튜닝 중 잘못된 값이 다음 부팅부터 남는 것을 막기 위해서다."""
+    return build_frame(target_id, OpCode.SaveParameters, b"")
+
+
+# ---- 미션코드 (확장 규격 §2.5) ----
+MISSION_TYPE_TABLE = 1
+MISSION_HDR_LEN = 32
+MISSION_REC_LEN = 8
+MISSION_KIND_ANGLE = 0
+
+MISSION_RUN, MISSION_STOP, MISSION_PAUSE, MISSION_RESUME = 1, 2, 3, 4
+MISSION_STATE = {0: "없음", 1: "적재됨", 2: "실행중"}
+
+
+def build_mission_record(t_ms: int, node_id: int, angle_deg: float) -> bytes:
+    """TYPE=1 키프레임 1개(8B). [t_ms u16][node u8][kind u8][value i32 0.01°] — little-endian.
+
+    헤더·본문은 플래시에 그대로 얹히는 구조라 호스트 표현(LE)을 쓴다. 와이어 BE 규약은
+    표준 프레임 헤더에만 적용된다.
+    """
+    return (int(t_ms).to_bytes(2, "little") + bytes((node_id & 0xFF, MISSION_KIND_ANGLE)) +
+            int(round(angle_deg * 100)).to_bytes(4, "little", signed=True))
+
+
+def build_mission_upload_begin(total_len: int, crc32: int, unit_sig: int = 0,
+                               mission_type: int = MISSION_TYPE_TABLE,
+                               *, target_id: int = ADDR_HUB) -> bytes:
+    """MissionUploadBegin(0xF0). [type][total_len u32][crc32 u32][unit_sig u32] — 13B."""
+    return build_frame(target_id, OpCode.MissionUploadBegin,
+                       bytes((mission_type & 0xFF,)) + int(total_len).to_bytes(4, "big") +
+                       (crc32 & 0xFFFFFFFF).to_bytes(4, "big") +
+                       (unit_sig & 0xFFFFFFFF).to_bytes(4, "big"))
+
+
+def build_mission_upload_chunk(seq: int, data: bytes, *, target_id: int = ADDR_HUB) -> bytes:
+    """MissionUploadChunk(0xF1). [seq u16][data…]. seq는 0부터 1씩."""
+    return build_frame(target_id, OpCode.MissionUploadChunk,
+                       int(seq).to_bytes(2, "big") + bytes(data))
+
+
+def build_mission_upload_commit(*, target_id: int = ADDR_HUB) -> bytes:
+    """MissionUploadCommit(0xF2). CRC 검증 후 활성 슬롯 전환."""
+    return build_frame(target_id, OpCode.MissionUploadCommit, b"")
+
+
+def build_get_mission_info(*, target_id: int = ADDR_HUB) -> bytes:
+    """GetMissionInfo(0xF3). 회신 = [state][헤더 32B]."""
+    return build_frame(target_id, OpCode.GetMissionInfo, b"")
+
+
+def build_delete_mission(*, target_id: int = ADDR_HUB) -> bytes:
+    """DeleteMission(0xF4)."""
+    return build_frame(target_id, OpCode.DeleteMission, b"")
+
+
+def build_mission_control(action: int, *, target_id: int = ADDR_HUB) -> bytes:
+    """MissionControl(0xF9). [action] 1=Run 2=Stop 3=Pause 4=Resume."""
+    return build_frame(target_id, OpCode.MissionControl, bytes((action & 0xFF,)))
+
+
+def parse_mission_info(payload: bytes):
+    """0xF3 회신 → dict. 형식이 아니면 None."""
+    if len(payload) < 1 + MISSION_HDR_LEN:
+        return None
+    st, h = payload[0], payload[1:1 + MISSION_HDR_LEN]
+    if h[:4] != b"RCMS":
+        return {"state": st, "valid": False}
+    return {
+        "state": st,
+        "valid": True,
+        "ver": h[4], "type": h[5], "flags": h[6], "n_nodes": h[7],
+        "unit_sig": int.from_bytes(h[8:12], "little"),
+        "body_len": int.from_bytes(h[12:16], "little"),
+        "body_crc": int.from_bytes(h[16:20], "little"),
+        "name": h[20:32].split(b"\0")[0].decode("utf-8", "replace"),
+    }
+
+
 # ---- TimeSync (확장 규격 §3.2) ----
 TS_FLAG_ROUNDTRIP = 0x01
 TS_FLAG_OFFSET = 0x02
@@ -441,10 +550,14 @@ def build_reset_config(*, target_id: int = ADDR_BROADCAST) -> bytes:
     return build_frame(target_id, OpCode.ResetConfig, b"")
 
 
+AGG_FLAG_ORDERED = 0x01   # Flags bit0 — 1=고정형(광고 NN), 0=비고정형(연결 순서)
+
+
 def build_set_aggregator(
     connection_link_count: int,
     *,
     group_enabled: bool = False,
+    ordered: bool = False,
     virtual_ids=None,
     target_id: int = ADDR_HUB,
 ) -> bytes:
@@ -453,12 +566,15 @@ def build_set_aggregator(
     payload = [ConnectionLinkCount][GroupMode][Flags] (+ 고정형이면 VirtualCubeId 4B×n)
     - connection_link_count : 연결 대상 큐브 수(계약상 허브 포함 총 N)
     - group_enabled=False   : GROUP_DISABLED(0x0A) 그룹 무관 연결
+    - ordered=False         : 비고정형 초기구성 — 가상ID를 연결 순서로 배정
+      ordered=True          : 고정형 재연결   — 가상ID를 광고 노드ID(NN)로 배정
 
-    ※ 고정형/비고정형은 PC가 지시하지 않는다. 기획서 7.5 [새 방식]대로 허브 큐브가
-      자기 저장 노드ID 유무로 스스로 판정한다(Flags는 0으로 예약).
+    ★ 절차는 PC가 지시한다(확장 규격 §2.2, 2026-07-30 정정). 허브가 자기 저장 노드ID로
+      판정하면 이미 노드ID가 있는 큐브들로 비고정형 재구성을 할 수 없다.
     """
     mode = GROUP_ENABLED if group_enabled else GROUP_DISABLED
-    payload = bytearray((connection_link_count & 0xFF, mode, 0x00))
+    flags = AGG_FLAG_ORDERED if ordered else 0x00
+    payload = bytearray((connection_link_count & 0xFF, mode, flags))
     if virtual_ids:
         for vid in virtual_ids:
             payload += int(vid).to_bytes(4, "big")

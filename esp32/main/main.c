@@ -36,6 +36,8 @@
 #include "bmi088.h"
 #include "can_transport.h"
 #include "rcube_sensor.h"
+#include "rcube_params.h"
+#include "rcube_mission.h"
 #include "motor_uart.h"
 #include "motion_core.h"
 
@@ -256,6 +258,12 @@ void app_main(void)
     rcube_buzzer_play(RCUBE_MELODY_START);
     ESP_LOGI(TAG, "boot OK -> LED(노드ID %s) + START melody",
              rcube_config_node_id() ? "색 점멸" : "흰색 점멸(미할당)");
+
+    /* 모터 파라미터·리밋(기획서 8장 3단 안전) — 모션보다 먼저 올라와야 목표를 걸러낸다. */
+    rcube_params_init();
+
+    /* 미션코드 저장소(기획서 8장) — storage 파티션 슬롯 2개. */
+    rcube_mission_init();
 
     /* 센서 모니터링(기획서 9장) — 전송은 상위의 B1 명령으로 시작한다. */
     rcube_sensor_init();

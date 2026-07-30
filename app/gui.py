@@ -633,8 +633,10 @@ class RCubeApp:
         if n == 1:
             self.ui_q.put(("scn_done", n))
             return
-        # 3) BLE 허브로 승격 + 총 큐브 수 통지. 고정형/비고정형은 큐브가 스스로 판정한다(7.5).
-        await self.ble.send(build_set_aggregator(n, group_enabled=False))
+        # 3) BLE 허브로 승격 + 총 큐브 수 통지.
+        #    ordered=False → 허브가 저장 노드ID를 무시하고 연결 순서로 가상ID를 배정한다.
+        #    이미 노드ID가 저장된 큐브로 재구성할 때도 순서가 우선이어야 한다(§2.2).
+        await self.ble.send(build_set_aggregator(n, group_enabled=False, ordered=False))
         self.ui_q.put(("log", f"[scn] SetMultiroleAggregator 전송(총 {n}대). 멤버 0/{n-1} 대기…"))
 
     async def _scn_start_fixed(self, ble: list) -> None:
@@ -659,8 +661,8 @@ class RCubeApp:
             self.ui_q.put(("log", "[고정형/BLE] 단일 BLE 큐브 연결 완료"))
             self.ui_q.put(("scn_done", self.scn_total))
             return
-        # 허브에 "BLE로 세팅된 큐브 수"를 전달. 고정형 판정은 허브가 자기 노드ID로 한다(7.5).
-        await self.ble.send(build_set_aggregator(count, group_enabled=False))
+        # 허브에 "BLE로 세팅된 큐브 수"를 전달. ordered=True → 가상ID = 광고 노드ID(NN).
+        await self.ble.send(build_set_aggregator(count, group_enabled=False, ordered=True))
         self.ui_q.put(("log", f"[고정형/BLE] 허브가 BLE 멤버 {count - 1}대 연결 대기… "
                               f"(대상 노드ID {ble[1:]})"))
 

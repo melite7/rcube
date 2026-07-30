@@ -20,15 +20,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* A0 Flags bit0 — 연결 절차를 PC가 지시한다(확장 규격 §2.2, 2026-07-30 정정). */
+#define RCUBE_AGG_FLAG_ORDERED 0x01u
+
 /* BLE 허브 승격: 멤버 스캔·연결 시작(link_count = 본인 포함 총 N).
  *
- * 고정형/비고정형은 기획서 7.5 [새 방식]대로 "저장 노드ID 유무"로 스스로 판정한다
- * (별도 플래그·전환 명령 없음):
- *   - 자기 node_id == 0 (비고정형 초기구성) : 아무 R큐브나 연결 순서대로 붙이고
- *     가상ID 2,3,…을 배정한다.
- *   - 자기 node_id != 0 (고정형 재연결)     : 광고이름의 NN≥1인 큐브만 붙이고
- *     그 NN을 그대로 가상ID로 쓴다(연결 순서 무관). */
-void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode);
+ * flags & RCUBE_AGG_FLAG_ORDERED 로 절차가 갈린다.
+ *   0 = 비고정형 초기구성 : 저장 노드ID를 무시하고 "연결 순서"로 가상ID 2,3,…을
+ *       배정한다. 이미 노드ID가 저장된 큐브로도 순서를 다시 매길 수 있어야 하므로
+ *       허브 자신의 노드ID로 판정하지 않는다.
+ *   1 = 고정형 재연결     : 광고이름의 NN≥1인 큐브만 붙이고 그 NN을 가상ID로 쓴다
+ *       (연결 순서 무관 — 비연속 노드ID·혼합유닛의 BLE 부분집합도 처리된다). */
+void ble_multirole_start_aggregator(uint8_t link_count, uint8_t group_mode, uint8_t flags);
 
 /* edge central 시작(기획서 7.4-3·4 [BLE 멤버]).
  *
