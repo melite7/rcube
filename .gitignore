@@ -2,6 +2,9 @@
 # R큐브 저장소 공통 .gitignore
 # ==========================================================
 
+# ---- Office 임시/락 파일 (xlsx를 열어두면 생긴다) ----
+~$*
+
 # ---- Claude Code 개인 설정 ----
 # settings.json은 팀 공유(커밋), settings.local.json은 개인용이라 커밋하지 않는다.
 **/.claude/settings.local.json
