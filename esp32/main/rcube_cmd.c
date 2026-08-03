@@ -23,13 +23,65 @@ static const char *TAG = "cmd";
 
 #define HEADER_LEN 4
 
-/* 전송계층 위임 콜백. */
+/* 전송계층 위임 콜백. s_ops.send = BLE notify(peripheral), s_alt_send = CAN 회신. */
 static rcube_cmd_ops_t s_ops;
+static rcube_send_fn s_alt_send;
 
-/* 이 큐브가 직접 처리해야 하는 대상 주소인지(직접연결 허브 · 브로드캐스트). */
+/* 회신 경로 선택: PC가 BLE로 붙어 있으면 BLE, 아니면 CAN.
+ *
+ * CMF=CAN 큐브도 설정모드(RCUBECONFIG 광고)에서는 PC가 BLE로 직접 붙는다 —
+ * 이때 회신을 CAN으로만 보내면 PC는 A0의 0xA1(멤버 수)도, D4도 영영 못 받는다
+ * (앱의 네트워크 설정이 활성화되지 않던 원인). BLE notify는 연결이 없으면
+ * 실패를 돌려주므로, 그 실패를 그대로 "CAN으로 보내라"는 신호로 쓴다. */
+static int reply_send(const uint8_t *frame, uint16_t len)
+{
+    if (s_ops.send != NULL && s_ops.send(frame, len) == 0) {
+        return 0;
+    }
+    if (s_alt_send != NULL) {
+        return s_alt_send(frame, len);
+    }
+    return -1;
+}
+
+/* 회신을 보낼 경로가 하나라도 있는지. */
+static inline bool can_reply_anywhere(void)
+{
+    return s_ops.send != NULL || s_alt_send != NULL;
+}
+
+/* 이 큐브가 직접 처리해야 하는 대상 주소인지(직접연결 허브 · 브로드캐스트).
+ *
+ * ★여기에 "자기 저장 노드ID"를 넣으면 안 된다. BLE에서 상위가 쓰는 target은 저장
+ * 노드ID가 아니라 가상ID(1..N)이고, 비고정형에서는 두 숫자 공간이 겹친다 —
+ * 아그리게이터의 저장 노드ID가 2일 때 "가상2 멤버에게 보내는 E0"를 자기 명령으로
+ * 삼켜 버려, 멤버는 색을 못 받고 아그리게이터만 엉뚱한 색이 된다.
+ * 각 전송계층이 "나에게 온 것"을 0xFE로 정규화해서 넘긴다:
+ *   - BLE 멤버 : 아그리게이터가 중계하며 target을 0xFE로 재기입(ble_multirole_forward)
+ *   - CAN      : rx_task가 DstId==자기 노드ID면 0xFE로 재기입(can_transport) */
 static inline bool addr_for_me(uint8_t target)
 {
     return target == RCUBE_ADDR_HUB || target == RCUBE_ADDR_BROADCAST;
+}
+
+/* 회신·상태 알림 계열 OpCode인지. 이런 프레임은 "명령"이 아니므로 절대 CmdAck으로
+ * 되받으면 안 된다.
+ *
+ * ★CAN 버스에서는 이 구분이 없으면 무한 증폭이 일어난다: 하트비트(0xD1)가
+ * 브로드캐스트로 오면 모든 큐브가 "미구현 OpCode"라며 CmdAck(0xAF)을 dst=0xFE로 쏘고,
+ * 그 0xAF를 또 모든 큐브가 자기 것으로 받아 다시 0xAF로 답한다 → 버스와 CPU가
+ * 포화되고(부팅음이 늘어질 정도), 실제 명령이 묻힌다. */
+static inline bool is_response_op(uint8_t op)
+{
+    switch (op) {
+    case RCUBE_OP_CmdAck:               /* 0xAF 명령 회신 */
+    case RCUBE_OP_Heartbeat:            /* 0xD1 CAN 하트비트(상태 알림) */
+    case RCUBE_OP_NodeAnnounce:         /* 0xD9 부팅 알림 */
+    case RCUBE_OP_SetMultiroleInAction: /* 0xA1 멤버 수 보고 */
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* PacketSize(BE)를 프레임 앞 4바이트에 채운다. */
@@ -48,7 +100,7 @@ static inline void put_header(uint8_t *f, uint8_t target, uint8_t op, uint16_t t
  *   펌웨어가 먼저 정한 계약(app과 맞춰야 함, 미검증). 발신=자기(허브). */
 static void reply_cmd_ack(uint8_t req_op, uint8_t result)
 {
-    if (s_ops.send == NULL) {
+    if (!can_reply_anywhere()) {
         return;
     }
     uint8_t f[HEADER_LEN + 2];
@@ -56,21 +108,21 @@ static void reply_cmd_ack(uint8_t req_op, uint8_t result)
     put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_CmdAck, total);
     f[4] = req_op;
     f[5] = result;
-    s_ops.send(f, total);
+    reply_send(f, total);
 }
 
 /* SetMultiroleInAction(0xA1) 회신: payload[0]=현재 연결된 멤버 수(본인 제외).
  * app(gui.py)이 이 값을 보고 R2~R4 진행도를 갱신한다(계약). */
 void rcube_cmd_report_members(uint8_t members_connected)
 {
-    if (s_ops.send == NULL) {
+    if (!can_reply_anywhere()) {
         return;
     }
     uint8_t f[HEADER_LEN + 1];
     uint16_t total = sizeof(f);
     put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_SetMultiroleInAction, total);
     f[4] = members_connected;
-    s_ops.send(f, total);
+    reply_send(f, total);
     ESP_LOGI(TAG, "→ 0xA1 report: members=%u", members_connected);
 }
 
@@ -218,7 +270,7 @@ static uint8_t handle_set_node_config(uint8_t target, const uint8_t *p, uint16_t
  * 멤버가 보낸 회신은 아그리게이터가 notify를 받아 PC로 중계한다(ble_multirole). */
 static void reply_node_config(void)
 {
-    if (s_ops.send == NULL) {
+    if (!can_reply_anywhere()) {
         return;
     }
     uint8_t f[HEADER_LEN + 4];
@@ -228,7 +280,7 @@ static void reply_node_config(void)
     f[5] = rcube_config_node_id();
     f[6] = rcube_config_cmf();
     f[7] = rcube_config_term_id();
-    s_ops.send(f, total);
+    reply_send(f, total);
     ESP_LOGI(TAG, "→ 0xD4 회신: group=0x%02x node=0x%02x cmf=%u term=0x%02x",
              f[4], f[5], f[6], f[7]);
 }
@@ -253,10 +305,7 @@ static uint8_t handle_set_sensor_stream(const uint8_t *p, uint16_t plen)
 
 int rcube_cmd_send_frame(const uint8_t *frame, uint16_t len)
 {
-    if (s_ops.send == NULL) {
-        return -1;
-    }
-    return s_ops.send(frame, len);
+    return reply_send(frame, len);
 }
 
 int rcube_cmd_sensor_stream_all(bool on, uint16_t period_ms)
@@ -313,7 +362,7 @@ static uint8_t handle_set_edge_config(const uint8_t *p, uint16_t plen)
 /* D6 GetEdgeCentralConfig 회신: D5와 같은 레이아웃으로 현재 저장값을 돌려준다. */
 static void reply_edge_config(void)
 {
-    if (s_ops.send == NULL) {
+    if (!can_reply_anywhere()) {
         return;
     }
     uint8_t f[HEADER_LEN + D5_PAYLOAD_LEN];
@@ -323,7 +372,7 @@ static void reply_edge_config(void)
     f[5] = rcube_config_unit_count();
     f[6] = rcube_config_term_id();
     memcpy(&f[7], rcube_config_member_map(), RCUBE_MAX_NODES);
-    s_ops.send(f, total);
+    reply_send(f, total);
     ESP_LOGI(TAG, "→ 0xD6 회신: ecf=%u unit_n=%u term=0x%02x", f[4], f[5], f[6]);
 }
 
@@ -391,6 +440,13 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
     /* PacketSize 는 검증만 하고, 실제 수신 길이를 신뢰한다(BLE 조각화 방어). */
     if (declared != 0 && declared != len) {
         ESP_LOGW(TAG, "PacketSize 불일치: 선언=%u, 실제=%u (실제 길이로 처리)", declared, len);
+    }
+
+    /* 회신·상태 알림은 조용히 소비한다(중계도, CmdAck도 하지 않는다). CAN 브로드캐스트
+     * 하트비트에 전원이 NAK으로 답하는 무한 루프를 여기서 끊는다. */
+    if (is_response_op(op)) {
+        ESP_LOGD(TAG, "회신/상태 프레임 무시: op=0x%02x target=0x%02x", op, target);
+        return;
     }
 
     ESP_LOGI(TAG, "RX frame: target=0x%02x op=0x%02x payload=%u bytes", target, op, plen);
@@ -485,10 +541,10 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
     case RCUBE_OP_GetMissionInfo: {
         uint8_t f[HEADER_LEN + 1 + RCUBE_MISSION_HDR_LEN];
         uint8_t n = rcube_mission_info(&f[4], sizeof(f) - HEADER_LEN);
-        if (n > 0 && s_ops.send != NULL) {
+        if (n > 0 && can_reply_anywhere()) {
             uint16_t total = (uint16_t)(HEADER_LEN + n);
             put_header(f, RCUBE_ADDR_HUB, RCUBE_OP_GetMissionInfo, total);
-            s_ops.send(f, total);   /* 회신이 곧 응답 */
+            reply_send(f, total);   /* 회신이 곧 응답 */
         }
         break;
     }
@@ -534,7 +590,11 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
 
     default:
         ESP_LOGW(TAG, "미구현 OpCode 0x%02x (미지원)", op);
-        reply_cmd_ack(op, RCUBE_RC_BAD_OPCODE);
+        /* 브로드캐스트에는 NAK을 돌려주지 않는다 — 유닛의 모든 큐브가 동시에 같은
+         * NAK을 쏟아내 버스를 잡아먹는다. 요청자가 개별로 물어보면 그때 답한다. */
+        if (target != RCUBE_ADDR_BROADCAST) {
+            reply_cmd_ack(op, RCUBE_RC_BAD_OPCODE);
+        }
         break;
     }
 }
@@ -551,6 +611,8 @@ void rcube_cmd_init(const rcube_cmd_ops_t *ops)
 
 void rcube_cmd_override_send(rcube_send_fn send)
 {
-    s_ops.send = send;
-    ESP_LOGI(TAG, "응답 콜백 교체(CAN 회신 경로)");
+    /* BLE notify를 지우지 않고 대체 경로로 등록한다. 회신은 reply_send()가
+     * "BLE 연결 있으면 BLE, 없으면 CAN"으로 고른다(설정모드 BLE 접속 대응). */
+    s_alt_send = send;
+    ESP_LOGI(TAG, "CAN 회신 경로 등록(BLE 미연결 시 사용)");
 }

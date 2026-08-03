@@ -50,7 +50,10 @@ typedef struct {
 /* 명령 레이어 초기화. ops 는 호출 이후에도 유효한 저장소를 가리켜야 한다. */
 void rcube_cmd_init(const rcube_cmd_ops_t *ops);
 
-/* 응답(회신) 콜백만 교체한다. CAN 큐브가 회신을 CAN으로 보내도록 할 때 사용. */
+/* CAN 회신 경로를 등록한다(CMF=CAN 큐브가 부팅 시 호출).
+ * BLE notify를 대체하는 게 아니라 대안으로 더한다 — 회신은 PC가 BLE로 붙어 있으면
+ * BLE로, 아니면 CAN으로 나간다. 설정모드에서 BLE로 붙은 CAN 큐브가 0xA1·D4 회신을
+ * PC에 돌려줄 수 있어야 하기 때문이다. */
 void rcube_cmd_override_send(rcube_send_fn send);
 
 /* 수신한 원시 프레임 1개를 파싱·디스패치한다. (BLE write 콜백에서 호출) */

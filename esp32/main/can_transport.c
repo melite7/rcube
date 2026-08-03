@@ -6,11 +6,13 @@
 #include "rcube_sensor.h"
 
 #include <string.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "driver/gpio.h"
 #include "driver/twai.h"
 
@@ -366,7 +368,10 @@ static void rx_task(void *arg)
         }
 
         uint16_t total = (uint16_t)(4 + plen);
-        frame[0] = dst;
+        /* CAN은 DstId에 노드ID를 그대로 싣는다. 명령 레이어는 "나에게 온 것"을 0xFE로
+         * 보므로(BLE 중계와 동일한 규약), 내 노드ID로 온 프레임은 여기서 0xFE로
+         * 정규화한다. 이렇게 하면 가상ID/저장 노드ID가 겹쳐도 오인이 없다. */
+        frame[0] = (dst == s_node_id) ? RCUBE_ADDR_HUB : dst;
         frame[1] = op;
         frame[2] = (uint8_t)((total >> 8) & 0xFF);
         frame[3] = (uint8_t)(total & 0xFF);
@@ -374,6 +379,36 @@ static void rx_task(void *arg)
         ESP_LOGI(TAG, "RX op=0x%02x src=0x%02x dst=0x%02x dlc=%u",
                  op, RCUBE_CAN_SRC(id), dst, dlc);
         rcube_cmd_on_frame(frame, total);
+    }
+}
+
+/* ---- 버스 상태 감시/복구 --------------------------------------------
+ * TWAI는 송신 에러가 쌓이면(TEC≥256) BUS-OFF로 떨어지고, 그 뒤의 twai_transmit는
+ * 전부 ESP_ERR_INVALID_STATE로 거부된다. 드라이버는 스스로 복귀하지 않으므로
+ * (twai_initiate_recovery → 버스가 조용해지면 STOPPED → twai_start) 여기서 되살린다.
+ *
+ * 이게 없으면 "큐브를 먼저 켜고 PC/PCAN을 나중에 연결" 하는 흔한 순서에서
+ * 첫 프레임이 ACK를 못 받아 즉시 BUS-OFF → 재부팅 전까지 영영 조용해진다. */
+static void bus_watch(void)
+{
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) != ESP_OK) {
+        return;
+    }
+    switch (st.state) {
+    case TWAI_STATE_BUS_OFF:
+        ESP_LOGW(TAG, "BUS-OFF (tx_err=%"PRIu32" bus_err=%"PRIu32" tx_failed=%"PRIu32
+                      " arb_lost=%"PRIu32") → 복구 시작",
+                 st.tx_error_counter, st.bus_error_count, st.tx_failed_count, st.arb_lost_count);
+        twai_initiate_recovery();
+        break;
+    case TWAI_STATE_STOPPED:
+        if (twai_start() == ESP_OK) {
+            ESP_LOGI(TAG, "버스 복구 완료 — 송신 재개");
+        }
+        break;
+    default:
+        break;
     }
 }
 
@@ -386,13 +421,31 @@ static void heartbeat_task(void *arg)
 
     TickType_t last = xTaskGetTickCount();
     uint32_t fail = 0;
+    uint32_t tick = 0;
     while (1) {
+        bus_watch();   /* BUS-OFF면 복구를 걸고, 복구가 끝났으면 다시 start */
+
         esp_err_t err = can_transport_send(RCUBE_PRI_SAFETY_SYNC, RCUBE_OP_Heartbeat,
                                            RCUBE_ADDR_BROADCAST, &nd, 1);
         if (err != ESP_OK) {
             if ((fail++ % 10) == 0) {
                 ESP_LOGW(TAG, "heartbeat TX 실패(%s) — 트랜시버/버스 확인(개발보드는 정상)",
                          esp_err_to_name(err));
+            }
+        } else if (fail != 0) {
+            ESP_LOGI(TAG, "heartbeat TX 재개(실패 %"PRIu32"회 후)", fail);
+            fail = 0;
+        }
+
+        /* 진단: 10초마다 카운터를 남긴다(정상이면 전부 0). */
+        if ((tick++ % 10) == 0) {
+            twai_status_info_t st;
+            if (twai_get_status_info(&st) == ESP_OK) {
+                ESP_LOGI(TAG, "bus state=%d tx_err=%"PRIu32" rx_err=%"PRIu32" bus_err=%"PRIu32
+                              " tx_failed=%"PRIu32" arb_lost=%"PRIu32" rx=%"PRIu32,
+                         (int)st.state, st.tx_error_counter, st.rx_error_counter,
+                         st.bus_error_count, st.tx_failed_count, st.arb_lost_count,
+                         st.msgs_to_rx);
             }
         }
         vTaskDelayUntil(&last, pdMS_TO_TICKS(HEARTBEAT_MS));
@@ -413,6 +466,164 @@ static void gpio_out(gpio_num_t pin, int level)
     gpio_set_level(pin, level);
 }
 
+/* ---- 부팅 자가시험(진단용) ------------------------------------------
+ * NO_ACK 모드로 몇 프레임 쏴 본다. 이 모드는 상대의 ACK를 요구하지 않으므로,
+ * "버스에 아무도 없어서" 실패하는 경우와 "ESP↔트랜시버 구간이 잘못돼서" 실패하는
+ * 경우를 갈라준다(비트 되읽기 검사는 그대로 동작한다).
+ *   · 성공(state=RUNNING, bus_err=0) → TX/RX/트랜시버 정상. 앞선 BUS-OFF는 ACK 부재.
+ *     이때 프레임은 실제 버스로 나가므로 PCAN-View에도 보여야 한다.
+ *   · 실패(bus_err 급증)            → ESP↔트랜시버 구간 문제(TX/RX 교차, STB, VIO/전원,
+ *                                      또는 트랜시버 미실장).
+ * 배선을 의심할 상황이 오면 1로 켜서 부팅 로그만 보면 된다(평소엔 0).
+ *
+ * 2026-08-03 실사용 사례: 트랜시버 모듈(MCP2562FD)에 VIO(3.3V)만 주고 VDD(5V)를
+ * 빠뜨렸을 때, 이 시험이 "RXD는 구동됨 + 자기 dominant 되읽기 실패"로 곧장 짚어냈다. */
+#define CAN_SELFTEST_ON_BOOT 0
+
+#if CAN_SELFTEST_ON_BOOT
+/* 핀 레벨 루프백: TWAI 컨트롤러를 빼고 IO4(TXD)를 손으로 흔들어 IO5(RXD)를 읽는다.
+ * 트랜시버에 전원이 들어와 있고 CANH/CANL이 살아 있으면, TXD=0(dominant)을 내리는
+ * 순간 자기 자신이 만든 dominant를 RXD로 되받아야 한다(전파지연 수백 ns).
+ * ※ dominant 유지는 트랜시버의 TXD dominant timeout(수백 µs) 아래로 짧게만 한다. */
+static void can_pin_loopback_test(void)
+{
+    gpio_config_t tx = {
+        .pin_bit_mask = 1ULL << CAN_TX_GPIO, .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config_t rx = {
+        .pin_bit_mask = 1ULL << CAN_RX_GPIO, .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&tx);
+    gpio_config(&rx);
+
+    /* (a) RXD 선 자체가 "구동되는 출력"에 붙어 있는지 본다.
+     *     내부 풀다운을 걸어도 1로 읽히면 = 누군가(트랜시버 RXD)가 High로 밀고 있다.
+     *     풀다운에 끌려 0이 되면 = 그 핀은 떠 있다(미결선/무전원 하이임피던스). */
+    gpio_set_level(CAN_TX_GPIO, 1);
+    gpio_set_pull_mode(CAN_RX_GPIO, GPIO_PULLDOWN_ONLY);
+    esp_rom_delay_us(500);
+    int pd = gpio_get_level(CAN_RX_GPIO);
+    gpio_set_pull_mode(CAN_RX_GPIO, GPIO_PULLUP_ONLY);
+    esp_rom_delay_us(500);
+    int pu = gpio_get_level(CAN_RX_GPIO);
+    gpio_set_pull_mode(CAN_RX_GPIO, GPIO_FLOATING);
+
+    /* (b) STB 두 극성 모두에서 루프백을 시도한다. 모듈의 그 핀이 STBY(High=대기)가
+     *     아니라 EN(High=동작)이면, 우리가 Low로 잡는 지금이 오히려 "꺼짐"이다. */
+    int rec[2], dom[2];
+    for (int stb = 0; stb <= 1; stb++) {
+        gpio_set_level(CAN_STB_GPIO, stb);
+        esp_rom_delay_us(2000);              /* 모드 전환 시간 */
+        gpio_set_level(CAN_TX_GPIO, 1);      /* recessive */
+        esp_rom_delay_us(500);
+        rec[stb] = gpio_get_level(CAN_RX_GPIO);
+        gpio_set_level(CAN_TX_GPIO, 0);      /* dominant (TXD dominant timeout 아래로 짧게) */
+        esp_rom_delay_us(200);
+        dom[stb] = gpio_get_level(CAN_RX_GPIO);
+        gpio_set_level(CAN_TX_GPIO, 1);      /* 반드시 recessive로 복귀 */
+    }
+    gpio_set_level(CAN_STB_GPIO, 0);         /* 설계값(Low=정상)으로 복귀 */
+
+    ESP_LOGW(TAG, "[핀 루프백] RXD 선 상태: 풀다운=%d 풀업=%d %s", pd, pu,
+             pd == 1 ? "(구동되는 출력에 연결됨)" : "(떠 있음 — 미결선/무전원 의심)");
+    ESP_LOGW(TAG, "[핀 루프백] STB=0: TXD1→RXD%d, TXD0→RXD%d | STB=1: TXD1→RXD%d, TXD0→RXD%d",
+             rec[0], dom[0], rec[1], dom[1]);
+
+    const char *verdict;
+    if (rec[0] == 1 && dom[0] == 0) {
+        verdict = "정상 — 트랜시버 전원·루프백 OK (STB=Low가 맞음)";
+    } else if (rec[1] == 1 && dom[1] == 0) {
+        verdict = "★ STB=High에서만 루프백 성공 → 그 핀은 STBY가 아니라 EN(High=동작)이다. "
+                  "펌웨어의 STB 극성을 뒤집어야 한다";
+    } else if (pd == 0) {
+        verdict = "RXD가 떠 있다 → 트랜시버 무전원(VCC/GND) 또는 RXD 배선 끊김/미실장";
+    } else if (rec[0] == 0 && dom[0] == 0) {
+        verdict = "RXD가 항상 Low(dominant 고착) → CANH-CANL 단락 · 다른 노드 고착 의심";
+    } else {
+        verdict = "RXD는 구동되는데 자기 dominant가 안 돌아옴 "
+                  "→ 트랜시버가 송신 불가 상태(대기모드/VCC 부족) 또는 TXD 배선 끊김";
+    }
+    ESP_LOGW(TAG, "[핀 루프백] 판정: %s", verdict);
+
+    /* (c) 배선 교차 검사 — 역할을 뒤집어 본다.
+     *     IO4를 입력으로 두고 재보면, 거기에 "구동되는 출력"이 붙어 있다는 건
+     *     IO4가 트랜시버의 TXD(입력)가 아니라 RXD(출력)에 물려 있다는 뜻이다.
+     *     이어서 IO5를 출력으로 dominant를 내려 IO4가 따라 내려오면 교차 확정. */
+    gpio_set_direction(CAN_TX_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(CAN_TX_GPIO, GPIO_PULLDOWN_ONLY);
+    esp_rom_delay_us(500);
+    int tx_pd = gpio_get_level(CAN_TX_GPIO);
+    gpio_set_pull_mode(CAN_TX_GPIO, GPIO_FLOATING);
+
+    gpio_set_direction(CAN_RX_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(CAN_RX_GPIO, 1);
+    esp_rom_delay_us(500);
+    int rev_rec = gpio_get_level(CAN_TX_GPIO);
+    gpio_set_level(CAN_RX_GPIO, 0);
+    esp_rom_delay_us(200);
+    int rev_dom = gpio_get_level(CAN_TX_GPIO);
+    gpio_set_level(CAN_RX_GPIO, 1);
+
+    /* 원래 방향으로 되돌린다(TWAI 드라이버가 곧 핀을 다시 가져간다). */
+    gpio_set_direction(CAN_RX_GPIO, GPIO_MODE_INPUT);
+    gpio_set_direction(CAN_TX_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(CAN_TX_GPIO, 1);
+
+    ESP_LOGW(TAG, "[역방향] IO4 풀다운 읽기=%d · IO5출력 1→IO4=%d, IO5출력 0→IO4=%d%s",
+             tx_pd, rev_rec, rev_dom,
+             (rev_rec == 1 && rev_dom == 0)
+                 ? "  ★ 역방향 루프백 성공 = TXD/RXD 교차 배선(IO4↔RXD, IO5↔TXD)"
+                 : "");
+}
+
+static void can_selftest(void)
+{
+    can_pin_loopback_test();
+
+    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_GPIO, CAN_RX_GPIO,
+                                                          TWAI_MODE_NO_ACK);
+    twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    if (twai_driver_install(&g, &t, &f) != ESP_OK) {
+        ESP_LOGE(TAG, "[자가시험] 드라이버 설치 실패");
+        return;
+    }
+    if (twai_start() != ESP_OK) {
+        ESP_LOGE(TAG, "[자가시험] start 실패");
+        twai_driver_uninstall();
+        return;
+    }
+    twai_message_t m = {0};
+    m.identifier = RCUBE_CAN_ID(RCUBE_PRI_SAFETY_SYNC, RCUBE_OP_NodeAnnounce,
+                                0 /*multi*/, 0 /*flag*/, s_node_id, RCUBE_ADDR_BROADCAST);
+    m.extd = 1;
+    m.data_length_code = 1;
+    m.data[0] = s_node_id;
+    esp_err_t tx = ESP_OK;
+    for (int i = 0; i < 3 && tx == ESP_OK; i++) {
+        tx = twai_transmit(&m, pdMS_TO_TICKS(50));
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    twai_status_info_t st = {0};
+    twai_get_status_info(&st);
+    ESP_LOGW(TAG, "[자가시험 NO_ACK] tx=%s state=%d tx_err=%"PRIu32" bus_err=%"PRIu32
+                  " tx_failed=%"PRIu32" arb_lost=%"PRIu32" (0x%08"PRIX32" ×3 송신 시도)",
+             esp_err_to_name(tx), (int)st.state, st.tx_error_counter, st.bus_error_count,
+             st.tx_failed_count, st.arb_lost_count, m.identifier);
+    ESP_LOGW(TAG, "[자가시험] 판정: %s",
+             (st.state == TWAI_STATE_RUNNING && st.bus_error_count == 0)
+                 ? "TX/RX·트랜시버 정상 → 앞선 BUS-OFF는 버스에 ACK할 상대가 없었던 것"
+                 : "ESP↔트랜시버 구간 이상(TX/RX 교차·STB·전원·미실장 확인)");
+    twai_stop();
+    twai_driver_uninstall();
+}
+#endif
+
 esp_err_t can_transport_init(uint8_t node_id, uint8_t term_id)
 {
     s_node_id = node_id;
@@ -425,6 +636,10 @@ esp_err_t can_transport_init(uint8_t node_id, uint8_t term_id)
     gpio_out(CAN_TERM_EN_GPIO, terminate);
     ESP_LOGI(TAG, "STB=정상(Low), TERM_EN=%s (node=0x%02x, term=0x%02x)",
              terminate ? "ON(120Ω)" : "OFF", node_id, term_id);
+
+#if CAN_SELFTEST_ON_BOOT
+    can_selftest();
+#endif
 
     twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
     g.tx_queue_len = 5;
