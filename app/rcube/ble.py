@@ -10,6 +10,7 @@ ble.py — R큐브 BLE Central (PC측) 전송 어댑터. bleak 기반, async.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -94,6 +95,36 @@ class RCubeBLE:
                     name=name, address=dev.address, rssi=adv.rssi
                 )
         return sorted(found.values(), key=lambda s: (-(s.rssi or -999), s.name))
+
+    @staticmethod
+    async def scan_for(match=None, *, total: float = 60.0, step: float = 5.0,
+                       prefix=RCUBE_NAME_PREFIXES, on_progress=None,
+                       should_stop=None) -> list[ScanResult]:
+        """조건에 맞는 큐브가 광고할 때까지 step초 스캔을 total초까지 반복한다.
+
+        사용자가 R버튼을 누른 뒤 큐브 버튼을 눌러 연결모드에 넣기까지 시간이 걸리므로,
+        한 번의 스캔으로 끊지 않고 기다린다. 찾는 즉시 반환하므로 total을 늘려도
+        이미 광고 중인 큐브의 연결이 느려지지는 않는다.
+
+        match       : ScanResult -> bool. None이면 아무 R큐브나.
+        on_progress : (경과초, 총초) -> None. 한 회차 스캔이 빈손일 때 호출(대기 안내용).
+        should_stop : () -> bool. True를 돌려주면 즉시 중단(시나리오 해제 등).
+        반환        : 조건에 맞는 결과 목록(RSSI 순). 시간 내에 못 찾으면 빈 목록.
+        """
+        deadline = time.monotonic() + total
+        while True:
+            left = deadline - time.monotonic()
+            results = await RCubeBLE.scan(timeout=min(step, max(left, 0.5)), prefix=prefix)
+            hits = [r for r in results if match is None or match(r)]
+            if hits:
+                return hits
+            if should_stop is not None and should_stop():
+                return []
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return []
+            if on_progress is not None:
+                on_progress(total - left, total)
 
     # ---- 연결 ----
     async def connect(self, address: Optional[str] = None, timeout: float = 10.0) -> None:

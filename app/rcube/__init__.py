@@ -94,7 +94,15 @@ from .protocol import (
     OP_AGGREGATOR_EVENT,
 )
 from .ble import RCubeBLE, ScanResult, RCUBE_NAME_PREFIX, RCUBE_NAME_PREFIXES
-from .can import RCubeCAN, KNOWN_INTERFACES, DEFAULT_BITRATE
+from .can import (
+    RCubeCAN,
+    KNOWN_INTERFACES,
+    DEFAULT_BITRATE,
+    DEFAULT_INTERFACE,
+    DEFAULT_CHANNEL,
+    detect_adapters,
+    pcan_driver_installed,
+)
 
 __all__ = [
     "OpCode",
@@ -190,4 +198,8 @@ __all__ = [
     "RCubeCAN",
     "KNOWN_INTERFACES",
     "DEFAULT_BITRATE",
+    "DEFAULT_INTERFACE",
+    "DEFAULT_CHANNEL",
+    "detect_adapters",
+    "pcan_driver_installed",
 ]

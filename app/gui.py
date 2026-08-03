@@ -34,6 +34,10 @@ from rcube import (
     RCubeCAN,
     KNOWN_INTERFACES,
     DEFAULT_BITRATE,
+    DEFAULT_INTERFACE,
+    DEFAULT_CHANNEL,
+    detect_adapters,
+    pcan_driver_installed,
     build_frame,
     build_set_led,
     build_set_led_solid,
@@ -125,6 +129,12 @@ WHITE = (255, 255, 255)   # 노드ID 범위 밖(미할당 등) 대체색
 # 최소 RTT 표본을 쓴다(확장 규격 §3.2).
 TIMESYNC_SAMPLES = 7
 
+# 시나리오 시작 시 첫 큐브(비고정형) / BLE 허브(고정형)를 기다리는 시간.
+# R버튼을 누른 뒤 큐브 버튼을 눌러 연결모드에 넣기까지 걸리는 시간을 감안한 값이다.
+# STEP초 스캔을 TOTAL초까지 반복하되 발견 즉시 진행하므로, 이미 광고 중이면 지연이 없다.
+SEARCH_TOTAL_S = 60.0
+SEARCH_STEP_S = 5.0
+
 
 BTN_IDLE = {"bg": "#b8b8b8", "fg": "#000000", "activebackground": "#a8a8a8"}
 BTN_BUSY = {"bg": "#e69500", "fg": "#ffffff", "activebackground": "#cf8600"}
@@ -194,7 +204,12 @@ class RCubeApp:
         # 연결 방식 선택 — R{N}이 "몇 대짜리 유닛"을, 이 라디오가 "어떤 절차"를 정한다.
         #   비고정형(7.1) : 노드ID 미할당 큐브를 켜는 순서대로 BLE로만 구성(초기 구성).
         #   고정형(7.2-7) : 저장된 노드ID·통신방식대로 BLE 분기/CAN 분기를 나눠 재연결.
-        self.fixed_var = tk.BooleanVar(value=False)
+        # 기본값은 저장된 매핑 유무로 정한다(기획서 7.5). 통신방식 세팅에서 저장을 누른
+        # 순간 각 큐브에 노드ID가 기록돼 고정형이 되므로, 그 뒤로는 앱을 다시 켜도 고정형이
+        # 기본이어야 한다. 공장 초기화(D7)로 노드ID가 0이 되면 매핑도 지워져 비고정형으로
+        # 돌아온다. 물론 사용자가 라디오로 비고정형을 다시 고를 수는 있다
+        # (그때는 각 큐브를 설정모드로 BLE 연결해 재구성).
+        self.fixed_var = tk.BooleanVar(value=bool(self._load_netmap(quiet=True)))
         modef = ttk.Frame(scn)
         modef.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 2))
         ttk.Radiobutton(modef, text="비고정형 (7.1 초기 구성 · 켜는 순서 = 가상 노드ID)",
@@ -238,7 +253,7 @@ class RCubeApp:
         # 기획서 7.3-1: 체크하면 통신방식 세팅과 함께 리드 큐브(노드01)를 edge central로
         # 만든다(ECF=1 + 멤버 맵 + N 저장). 미션코드 업로드는 8장에서 붙인다.
         self.edge_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(netright, text="고정로봇유닛(독립)",
+        ttk.Checkbutton(netright, text="독립로봇유닛",
                         variable=self.edge_var, command=self._paint_net_save).pack(anchor="e")
         self.net_save_btn = tk.Button(netf, text="저장(재부팅)", command=self.on_save_netconf,
                                       state="disabled")
@@ -333,21 +348,23 @@ class RCubeApp:
         canf.pack(fill="x", **pad)
         ttk.Label(canf, text="interface").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.can_if = ttk.Combobox(canf, state="readonly", width=10, values=KNOWN_INTERFACES)
-        self.can_if.set("slcan")
+        self.can_if.set(DEFAULT_INTERFACE)
         self.can_if.grid(row=0, column=1, sticky="w")
         ttk.Label(canf, text="channel").grid(row=0, column=2, sticky="e", padx=4)
-        self.can_ch = tk.StringVar(value="COM4")
-        ttk.Entry(canf, textvariable=self.can_ch, width=12).grid(row=0, column=3, sticky="w")
+        self.can_ch = tk.StringVar(value=DEFAULT_CHANNEL)
+        self.can_ch_box = ttk.Combobox(canf, textvariable=self.can_ch, width=14)
+        self.can_ch_box.grid(row=0, column=3, sticky="w")
         ttk.Label(canf, text="bitrate").grid(row=0, column=4, sticky="e", padx=4)
         self.can_br = tk.StringVar(value=str(DEFAULT_BITRATE))
         ttk.Entry(canf, textvariable=self.can_br, width=8).grid(row=0, column=5, sticky="w")
-        ttk.Button(canf, text="열기", command=self.on_can_open).grid(row=0, column=6, padx=3)
-        ttk.Button(canf, text="닫기", command=self.on_can_close).grid(row=0, column=7, padx=3)
-        ttk.Button(canf, text="노드검색", command=self.on_can_discover).grid(row=0, column=8, padx=3)
-        ttk.Button(canf, text="순서연결", command=self.on_can_connect_ordered).grid(row=0, column=9, padx=3)
+        ttk.Button(canf, text="장치검색", command=self.on_can_detect).grid(row=0, column=6, padx=3)
+        ttk.Button(canf, text="열기", command=self.on_can_open).grid(row=0, column=7, padx=3)
+        ttk.Button(canf, text="닫기", command=self.on_can_close).grid(row=0, column=8, padx=3)
+        ttk.Button(canf, text="노드검색", command=self.on_can_discover).grid(row=0, column=9, padx=3)
+        ttk.Button(canf, text="순서연결", command=self.on_can_connect_ordered).grid(row=0, column=10, padx=3)
         self.can_status_var = tk.StringVar(value="● CAN 닫힘")
         ttk.Label(canf, textvariable=self.can_status_var).grid(
-            row=1, column=0, columnspan=9, sticky="w", padx=6, pady=(0, 4))
+            row=1, column=0, columnspan=11, sticky="w", padx=6, pady=(0, 4))
 
         # 6) 디버그(수동 제어)
         dbg = ttk.LabelFrame(self.root, text="디버그 — 수동 스캔·전송")
@@ -619,6 +636,26 @@ class RCubeApp:
             self._log(f"[R{n}] 시작 — 비고정형 초기 구성 (7.1) · 켜는 순서 = 가상 노드ID", "scn")
             self._run_scn(n, self._scn_start(n))
 
+    async def _find_cube(self, what: str, match=None):
+        """조건에 맞는 큐브가 광고할 때까지 최대 SEARCH_TOTAL_S초 기다린다(발견 즉시 반환).
+
+        R버튼을 누른 뒤 사용자가 큐브 버튼을 눌러 연결모드에 넣기까지 시간이 걸리므로,
+        5초 스캔 한 번으로 끊지 않는다. R버튼을 다시 눌러 시나리오를 해제하면 중단된다.
+        """
+        def progress(elapsed: float, total: float) -> None:
+            self.ui_q.put(("log", f"[검색] {what} 광고 대기… ({int(elapsed)}/{int(total)}초) "
+                                  f"— 큐브 버튼을 눌러 연결모드에 두세요. R버튼 재클릭=취소"))
+
+        hits = await RCubeBLE.scan_for(
+            match, total=SEARCH_TOTAL_S, step=SEARCH_STEP_S,
+            on_progress=progress, should_stop=lambda: self.active is None)
+        if not hits:
+            if self.active is None:
+                raise RuntimeError(f"{what} 검색이 취소되었습니다.")
+            raise RuntimeError(f"{int(SEARCH_TOTAL_S)}초 안에 {what}를 찾지 못했습니다. "
+                               f"전원과 연결모드(버튼)를 확인하세요.")
+        return hits[0]
+
     async def _scn_start(self, n: int) -> None:
         """기획서 7.1 공통 1단계 — 비고정형 BLE로 전체 구성.
 
@@ -626,7 +663,9 @@ class RCubeApp:
         BLE 허브가 되고 나머지를 연결 순서대로 취합한다. 노드ID는 저장하지 않는다.
         """
         # 1) 가장 먼저 광고 중인 R큐브에 연결 = 사용자가 첫 번째로 켠 큐브 = 가상1.
-        await self.ble.connect(None)
+        first = await self._find_cube("첫 큐브(가상1)")
+        self.ui_q.put(("log", f"[검색] 발견: {first}"))
+        await self.ble.connect(first.address)
         # 2) 그 큐브를 가상1 색(Red)으로.
         await self.ble.send(build_set_led_solid(ADDR_HUB, RED))
         self.ui_q.put(("log", "[scn] 가상1 → 빨강 LED (BLE 허브 후보)"))
@@ -649,12 +688,10 @@ class RCubeApp:
         hub = ble[0]              # 최소 BLE 노드ID = BLE 허브 큐브
         count = len(ble)          # BLE 분기 큐브 수(허브 포함)
         self.ui_q.put(("log", f"[고정형/BLE] 허브=노드{hub}, BLE {count}대 연결 시작"))
-        results = await RCubeBLE.scan(timeout=5.0)
-        addr = next((r.address for r in results if _parse_nn(r.name) == hub), None)
-        if addr is None:
-            raise RuntimeError(f"BLE 허브(노드ID {hub})를 찾지 못했습니다. "
-                               f"해당 큐브를 켜고 버튼으로 연결모드에 넣으세요.")
-        await self.ble.connect(addr)
+        found = await self._find_cube(f"BLE 허브(노드{hub})",
+                                      match=lambda r: _parse_nn(r.name) == hub)
+        self.ui_q.put(("log", f"[검색] 발견: {found}"))
+        await self.ble.connect(found.address)
         # 7.2-7 ★: 허브는 무조건 Red가 아니라 자기 노드ID 색으로 켜진다.
         await self.ble.send(build_set_led_solid(ADDR_HUB, NODE_RGB.get(hub, WHITE)))
         if count == 1:
@@ -750,7 +787,17 @@ class RCubeApp:
                 elif kind == "scan":
                     self._apply_scan(payload)
                 elif kind == "can_state":
-                    self.can_status_var.set("● CAN 열림" if payload else "● CAN 닫힘")
+                    if payload:
+                        self.can_status_var.set(f"● CAN 열림 — 버스 {self.can.state_text()}")
+                    else:
+                        self.can_status_var.set("● CAN 닫힘")
+                elif kind == "can_channels":
+                    chans, iface = payload
+                    self.can_ch_box["values"] = chans
+                    if chans:
+                        self.can_ch.set(chans[0])
+                    if iface in KNOWN_INTERFACES:
+                        self.can_if.set(iface)
         except queue.Empty:
             pass
         self.root.after(self.POLL_MS, self._pump_ui)
@@ -1079,6 +1126,15 @@ class RCubeApp:
             return
         self._log("[초기화] ResetConfig 브로드캐스트 → 전 큐브 공장 초기화 후 재부팅(연결 끊김)", "scn")
         self._run(self.ble.send(build_reset_config()))
+        # 노드ID=0(미할당)로 돌아갔으므로 고정형 재연결 근거가 사라진다 → 매핑 폐기 +
+        # 라디오도 비고정형으로 되돌린다(기획서 7.3 [노드ID/세팅 초기화 - 공통]).
+        try:
+            NETMAP_PATH.unlink(missing_ok=True)
+            self._log("[초기화] 저장된 매핑 폐기 → 비고정형으로 복귀")
+        except OSError as e:
+            self._log(f"[초기화] 매핑 파일 삭제 실패: {e}", "err")
+        self.fixed_var.set(False)
+        self._paint_mode_hint()
 
     def on_save_netconf(self) -> None:
         """큐브별 통신방식(BLE/CAN)을 저장시키고 전체 재부팅(기획서 7.2). 다음 부팅부터 적용."""
@@ -1102,7 +1158,7 @@ class RCubeApp:
         edge = bool(self.edge_var.get())
 
         if edge and not messagebox.askyesno(
-                "고정로봇유닛(독립) 전환",
+                "독립로봇유닛 전환",
                 f"노드01을 edge central(리드 큐브)로 만들고 멤버 맵을 저장합니다.\n\n"
                 f"구성: [{desc}] · 종단노드 {term}\n\n"
                 "저장 후 모든 큐브가 꺼집니다. 배선을 독립유닛 형태로 정리한 뒤\n"
@@ -1127,6 +1183,9 @@ class RCubeApp:
                 {"n": n, "term": term, "cmf": {str(v): c for v, c in choices.items()}},
                 ensure_ascii=False, indent=2), encoding="utf-8")
             self._log(f"[네트워크] 매핑 저장: {NETMAP_PATH.name}")
+            # 저장 = 노드ID/CMF 기록 = 고정형 전환(기획서 7.5). 다음 연결부터는 고정형이
+            # 기본이므로 라디오도 여기서 고정형으로 옮긴다(앱 재시작 시엔 매핑 파일이 근거).
+            self.fixed_var.set(True)
             self._paint_mode_hint()   # 고정형 안내문에 새 구성 반영
         except Exception as e:
             self._log(f"[네트워크] 매핑 저장 실패: {e}", "err")
@@ -1161,6 +1220,18 @@ class RCubeApp:
         threading.Thread(target=work, daemon=True).start()
 
     async def _save_netconf_coro(self, n: int, choices: dict, term: int, edge: bool) -> None:
+        # 0) 먼저 전 큐브의 ECF를 해제한다(멤버 맵도 삭제).
+        #    이전 구성에서 edge central이었던 큐브가 섞여 있으면, 이번에 서브로봇유닛으로
+        #    저장해도 그 큐브는 다음 부팅에서 다시 혼자 central이 되어 PC에 붙지 않는다.
+        #    독립로봇유닛으로 저장하는 경우엔 아래 7.3-3 단계에서 리드 큐브만 ECF=1로 올린다.
+        #    ※ D5는 term_id도 함께 쓰므로 1)의 SET_NETCONF보다 먼저 보낸다(term 보존).
+        empty_map = build_member_map({})
+        for vid in range(1, n + 1):
+            target = ADDR_HUB if vid == 1 else vid
+            await self.ble.send(build_set_edge_central(0, 0, term, empty_map, target_id=target))
+        await asyncio.sleep(0.2)
+        self.ui_q.put(("log", f"[네트워크] 전 큐브 ECF 해제(ECF=0 · 멤버맵 삭제) {n}대"))
+
         # 1) 각 큐브에 통신방식 세팅 저장(재부팅 없이). vid1=허브(0xFE), 그 외=멤버 중계.
         #    노드ID가 함께 저장되므로 이 시점에 고정형이 된다(기획서 7.5).
         for vid in range(1, n + 1):
@@ -1214,6 +1285,25 @@ class RCubeApp:
             self._run(self.ble.send(frame))
 
     # ---- CAN(USB-CAN) 핸들러 ----
+    def on_can_detect(self) -> None:
+        """꽂혀 있는 USB-CAN 어댑터를 찾아 채널 목록을 채운다."""
+        self._log("[CAN] USB-CAN 어댑터 검색 중…")
+
+        def work():
+            cfgs = detect_adapters()
+            if cfgs:
+                chans = [str(c.get("channel")) for c in cfgs]
+                self.ui_q.put(("can_channels", (chans, cfgs[0].get("interface", ""))))
+                for c in cfgs:
+                    self.ui_q.put(("log", f"[CAN] 발견: {c.get('interface')}/{c.get('channel')}"
+                                          f" {c.get('device_id', '')}"))
+            elif not pcan_driver_installed():
+                self.ui_q.put(("error", "PCANBasic.dll 없음 — PEAK 'PCAN-Driver for Windows'를 "
+                                        "설치하고 옵션에서 'PCAN-Basic API'를 함께 선택하세요."))
+            else:
+                self.ui_q.put(("error", "USB-CAN 어댑터를 찾지 못했습니다 — USB 연결을 확인하세요."))
+        threading.Thread(target=work, daemon=True).start()
+
     def on_can_open(self) -> None:
         interface = self.can_if.get()
         channel = self.can_ch.get().strip()

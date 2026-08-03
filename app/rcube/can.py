@@ -35,7 +35,44 @@ StateCb = Callable[[bool], None]
 DEFAULT_BITRATE = 500000
 
 # python-can 인터페이스 예시(어댑터에 맞게 선택).
-KNOWN_INTERFACES = ["slcan", "pcan", "kvaser", "ixxat", "vector", "usb2can", "socketcan", "virtual"]
+KNOWN_INTERFACES = ["pcan", "slcan", "kvaser", "ixxat", "vector", "usb2can", "socketcan", "virtual"]
+
+# 기본 어댑터: PEAK PCAN-USB opto(IPEH-002022). 채널명은 PCAN-Basic 규약.
+DEFAULT_INTERFACE = "pcan"
+DEFAULT_CHANNEL = "PCAN_USBBUS1"
+
+
+def detect_adapters(interfaces=("pcan",)) -> list[dict]:
+    """꽂혀 있는 USB-CAN 어댑터를 찾아 [{interface, channel, ...}] 로 돌려준다.
+
+    기본값을 pcan 하나로 좁혀 둔다. 다른 백엔드까지 훑으면 python-can이 각 벤더
+    DLL을 import하면서 "Kvaser canlib is unavailable" 같은 경고를 쏟아내, 정작
+    중요한 메시지가 묻힌다. 다른 어댑터를 쓸 때 인자로 넘기면 된다.
+
+    python-can 백엔드는 드라이버 DLL이 없으면 조용히 빈 목록을 준다(PCAN 백엔드는
+    PCANBasic() 생성 시 OSError를 잡아 [] 반환). 즉 "빈 목록"은 '어댑터 없음'과
+    '드라이버 미설치'를 구분해 주지 않으므로, 호출부는 pcan_driver_installed()로
+    둘을 나눠 안내해야 한다.
+    """
+    try:
+        return list(can.detect_available_configs(interfaces=list(interfaces)))
+    except Exception:
+        return []
+
+
+def pcan_driver_installed() -> bool:
+    """PEAK PCAN-Basic API(PCANBasic.dll)가 설치되어 있는지.
+
+    PEAK 드라이버 설치 시 'PCAN-Basic API' 항목을 함께 선택해야 깔린다. 드라이버만
+    깔고 이 항목을 빼면 PCAN-View 같은 PEAK 도구는 되는데 python-can만 안 되는,
+    원인을 찾기 어려운 상태가 된다.
+    """
+    try:
+        from can.interfaces.pcan.pcan import PCANBasic  # type: ignore
+        PCANBasic()
+        return True
+    except Exception:
+        return False
 
 
 def default_priority(op: int) -> int:
@@ -187,7 +224,27 @@ class RCubeCAN:
         # virtual 은 bitrate 인자를 받지 않음.
         if interface != "virtual":
             kwargs["bitrate"] = bitrate
-        self._bus = can.Bus(**kwargs)
+        try:
+            self._bus = can.Bus(**kwargs)
+        except Exception as e:
+            # python-can이 DLL 부재/장치 미연결에 대해 던지는 예외가 불친절해서
+            # (OSError: [WinError 126] 등) 원인별로 다시 포장한다.
+            if interface == "pcan":
+                if not pcan_driver_installed():
+                    raise RuntimeError(
+                        "PEAK PCAN-Basic API(PCANBasic.dll)를 찾을 수 없습니다. "
+                        "PEAK-System 'PCAN-Driver for Windows'를 설치하되 설치 옵션에서 "
+                        "'PCAN-Basic API'를 반드시 함께 선택하세요."
+                    ) from e
+                # 드라이버는 있는데 채널이 없다 = 어댑터 미연결 또는 채널번호 불일치.
+                # PCAN-Basic의 원문("The value of a handle ... is invalid")으로는
+                # 무엇을 해야 하는지 알 수 없다.
+                if "handle" in str(e).lower():
+                    raise RuntimeError(
+                        f"PCAN 채널 '{channel}'을 열 수 없습니다 — 어댑터가 USB에 연결되어 "
+                        "있지 않거나 채널번호가 다릅니다. '장치검색'으로 실제 채널을 확인하세요."
+                    ) from e
+            raise
         self._stop.clear()
         with self._lock:
             self._nodes.clear()
@@ -213,6 +270,28 @@ class RCubeCAN:
         self._log("CAN 버스 닫힘")
         if self._on_state:
             self._on_state(False)
+
+    # ---- 버스 상태 ----
+    def state_text(self) -> str:
+        """버스 상태를 사람이 읽는 문자열로. 배선 진단의 1차 지표다.
+
+        CAN은 수신 확인(ACK)이 없으면 송신이 성립하지 않는다. 종단저항 누락·비트레이트
+        불일치·CANH/CANL 뒤바뀜은 모두 '송신은 했는데 아무 일도 없음'으로 보이고,
+        내부적으로는 에러카운터가 올라가다 error-passive → bus-off로 간다. 이 값을
+        보면 "배선 문제"와 "펌웨어가 응답을 안 함"을 구분할 수 있다.
+        """
+        if self._bus is None:
+            return "닫힘"
+        try:
+            st = self._bus.state
+        except Exception:
+            return "정상(상태조회 미지원 어댑터)"
+        name = getattr(st, "name", str(st))
+        return {
+            "ACTIVE": "error-active(정상)",
+            "PASSIVE": "error-passive — 에러 누적. 종단저항·비트레이트·결선 확인",
+            "ERROR": "BUS-OFF — 버스 이상. 종단 120Ω 양끝, 500kbit 일치, CANH/CANL 확인",
+        }.get(name, name)
 
     # ---- 송신 ----
     def send(self, frame: bytes, *, priority: Optional[int] = None) -> None:
