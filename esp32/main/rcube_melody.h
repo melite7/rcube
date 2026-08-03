@@ -34,9 +34,9 @@ typedef struct {
 typedef enum {
     RCUBE_MELODY_START = 0,        /* 부팅음(노드ID 미할당 큐브) */
     RCUBE_MELODY_BUTTON_PRESSED,   /* 버튼 눌림 */
-    RCUBE_MELODY_LINK,             /* 큐브 1개 연결 */
+    RCUBE_MELODY_LINK,             /* 연결 성립 — 멤버쪽은 자기가 붙을 때, 허브쪽은 멤버 1대가 붙을 때 */
     RCUBE_MELODY_LINK_COMPLETED,   /* 전체 연결 완료(유닛구성완료) */
-    RCUBE_MELODY_LINK_WAIT,        /* 연결모드 진입(연결대기) — 기획서 5장 [소리 규칙] */
+    RCUBE_MELODY_LINK_WAIT,        /* 연결대기 — 2026-07-30부터 미사용(rcube_melody.c 주석 참고) */
     RCUBE_MELODY_EDGE,             /* 연결모드 진입(edge central 전용 엣지 멜로디) */
     RCUBE_MELODY_DISCONNECT,       /* BLE 연결 끊김 — START를 역순으로(하행) */
     /* 그룹번호 알림. 음이 런타임(그룹번호)에 따라 정해지므로 고정 테이블이 없고,

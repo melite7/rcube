@@ -109,8 +109,10 @@ static void log_heap(const char *stage)
  *   ECF=1 (edge central / 리드 큐브) : 스스로 central로 시작한다. PC가 없으므로
  *     자기 광고는 하지 않고, 저장된 멤버 맵대로 BLE 멤버는 직접 스캔·연결하고
  *     CAN 멤버는 부팅/하트비트로 발견한다. 엣지 멜로디를 연주한다.
- *   ECF=0 (일반 큐브) : 연결대기 멜로디 + CMF에 따른 신호 발행
- *     (BLE면 RCUBEROBOT 광고, CAN이면 광고 없이 하트비트로 상위가 붙는다). */
+ *   ECF=0 (일반 큐브) : CMF에 따른 신호 발행만 한다
+ *     (BLE면 RCUBEROBOT 광고, CAN이면 광고 없이 하트비트로 상위가 붙는다).
+ *     여기서는 소리를 내지 않는다(2026-07-30) — 버튼음이 이미 눌림을 알렸고,
+ *     연결음은 상위가 실제로 붙는 시점(ble_rcube.c의 CONNECT)에 낸다. */
 static void enter_connect_mode(void)
 {
     if (rcube_config_ecf() == 1) {
@@ -131,7 +133,6 @@ static void enter_connect_mode(void)
         return;
     }
 
-    rcube_buzzer_play(RCUBE_MELODY_LINK_WAIT);
     if (ble_rcube_start_advertising()) {
         ESP_LOGI(TAG, "연결모드: BLE 광고 시작(RCUBEROBOT)");
     } else {
