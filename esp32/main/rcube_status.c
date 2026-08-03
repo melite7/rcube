@@ -141,8 +141,12 @@ void rcube_status_start(void)
 
 void rcube_status_set_mode(rcube_led_mode_t mode)
 {
-    /* 설정모드는 재부팅/명시 해제 전까지 다른 모드로 덮지 않는다(기획서 5장). */
-    if (s_mode == RCUBE_LED_CONFIG && mode != RCUBE_LED_CONFIG) {
+    /* 설정모드의 흰색 빠른 점멸은 "설정모드인데 아직 안 붙었다"는 표시다. 그래서
+     * 미연결 표시(IDLE = 광고중 1초 점멸)로는 덮이지 않는다 — 설정모드 광고를
+     * 시작할 때 adv_start()가 IDLE을 부르므로 그대로 두면 곧바로 지워진다.
+     * 반대로 상위가 실제로 붙으면(LINKED/HUB_WAIT) 설정모드 표시는 끝난다.
+     * 그래야 연결 후 노드ID/가상 노드ID 색이 보인다(기획서 5장). */
+    if (s_mode == RCUBE_LED_CONFIG && mode == RCUBE_LED_IDLE) {
         return;
     }
     if (s_mode != mode) {

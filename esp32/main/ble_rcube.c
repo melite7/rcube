@@ -230,6 +230,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_advertising = false;
             s_conn_handle = event->connect.conn_handle;
             xSemaphoreGive(s_lock);
+            /* 기획서 5장 [소리 규칙](2026-07-30): 상위(PC/앱/edge central)가 실제로
+             * 붙은 이 순간에 연결음을 낸다. 연결모드 진입(버튼)은 "붙을 준비가 됐다"일
+             * 뿐이라 그 시점에 소리를 내면 아직 안 붙었는데 붙은 것처럼 들린다.
+             * 끊길 때의 DISCONNECT와 짝을 이룬다. */
+            rcube_buzzer_play(RCUBE_MELODY_LINK);
             /* 연결 완료 → 상시 점등. 색은 고정형이면 자기 노드ID 색, 비고정형이면
              * 상위가 곧 보내줄 가상 노드ID 색(E0)이 덮어쓴다. */
             rcube_status_set_mode(RCUBE_LED_LINKED);
@@ -256,9 +261,15 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         /* PC 연결이 끊기면 아그리게이터 역할도 해제(멤버 전원 종료). */
         ble_multirole_stop_aggregator();
         /* 상위가 지정했던 가상 노드ID 색을 버리고 미연결 표시로 되돌린다
-         * (기획서 5장: 비고정형 가상색은 저장되지 않고 reset 후 흰색 점멸). */
+         * (기획서 5장: 비고정형 가상색은 저장되지 않고 reset 후 흰색 점멸).
+         * 설정모드 광고 중이었다면 설정모드 표시(흰색 0.25s)로 복귀한다 —
+         * 설정모드 자체는 재부팅 전까지 유지되고, LED만 연결 동안 양보한 것이다. */
         rcube_status_clear_color();
-        rcube_status_set_mode(RCUBE_LED_IDLE);
+        if (s_config_name) {
+            rcube_status_enter_config_mode();
+        } else {
+            rcube_status_set_mode(RCUBE_LED_IDLE);
+        }
         try_advertise();   /* 재연결을 위해 광고 재개 */
         return 0;
 
