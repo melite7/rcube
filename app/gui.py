@@ -141,6 +141,10 @@ BTN_BUSY = {"bg": "#e69500", "fg": "#ffffff", "activebackground": "#cf8600"}
 BTN_DONE = {"bg": "#111111", "fg": "#ffffff", "activebackground": "#333333"}
 BTN_DIS = {"bg": "#dddddd", "fg": "#999999"}
 
+# 큐브 연결 상태 박스: 대기=회색, 연결됨=검정
+BOX_IDLE = {"bg": "#b8b8b8", "fg": "#555555"}
+BOX_DONE = {"bg": "#111111", "fg": "#ffffff"}
+
 
 class RCubeApp:
     POLL_MS = 80
@@ -223,9 +227,15 @@ class RCubeApp:
         ttk.Label(scn, textvariable=self.mode_hint_var, wraplength=640, justify="left").grid(
             row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 4))
 
+        # 큐브별 연결 상태 박스 — R{N} 진행 중 큐브 수만큼 표시한다.
+        # 회색=대기, 검정=연결됨. 박스 아래 작은 글씨는 저장된 통신방식(BLE/CAN).
+        self.cube_rowf = ttk.Frame(scn)
+        self.cube_rowf.grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 4))
+        self.cube_boxes: dict[int, tk.Label] = {}
+
         self.status_var = tk.StringVar(value="● 대기")
         self.status_lbl = ttk.Label(scn, textvariable=self.status_var)
-        self.status_lbl.grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+        self.status_lbl.grid(row=4, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
         self._paint_mode_hint()
 
         # 2) 그룹번호 설정
@@ -533,6 +543,30 @@ class RCubeApp:
         self._paint_sensors()
         self._paint_motor()
 
+    # ---- 큐브 연결 상태 박스 ----
+    def _set_cube_boxes(self, entries) -> None:
+        """entries = [(큐브ID, "BLE"/"CAN"), …]. 빈 목록이면 박스를 지운다.
+
+        ID는 고정형이면 저장 노드ID, 비고정형이면 연결 순서로 받을 가상ID다.
+        """
+        for w in self.cube_rowf.winfo_children():
+            w.destroy()
+        self.cube_boxes.clear()
+        for col, (cube_id, cmf) in enumerate(entries):
+            cell = ttk.Frame(self.cube_rowf)
+            cell.grid(row=0, column=col, padx=(0, 8))
+            box = tk.Label(cell, text=f"{cube_id:02d}", width=4, height=2,
+                           font=("", 10, "bold"), relief="raised", **BOX_IDLE)
+            box.grid(row=0, column=0)
+            ttk.Label(cell, text=cmf, font=("", 7)).grid(row=1, column=0)
+            self.cube_boxes[cube_id] = box
+
+    def _mark_cube(self, cube_id: int) -> None:
+        """해당 큐브를 '연결됨'(검정)으로 바꾼다."""
+        box = self.cube_boxes.get(cube_id)
+        if box is not None:
+            box.configure(**BOX_DONE)
+
     def _set_net_ui(self, n: int) -> None:
         """네트워크 설정 UI를 큐브 n개로 구성(0이면 안내문만). 안정 상태면 재구성 안 함."""
         if n == self._net_ui_n:
@@ -608,6 +642,17 @@ class RCubeApp:
                 self._log(f"[고정형] R{n}을 눌렀지만 저장된 매핑은 {saved_n}대 구성입니다. "
                           f"R{saved_n}을 누르세요.", "err")
                 return
+            # CAN 분기는 PC가 직접 붙으므로 어댑터가 열려 있어야 한다. 사용자가 '열기'를
+            # 따로 누르지 않아도 되도록 설정값을 여기서 캡처해 두고, CAN 작업 스레드가
+            # 필요하면 스스로 연다(UI 변수는 UI 스레드에서만 읽는다).
+            can_cfg = None
+            if can_nodes:
+                try:
+                    can_cfg = (self.can_if.get(), self.can_ch.get().strip(),
+                               int(self.can_br.get().strip()))
+                except ValueError:
+                    self._log("[CAN] bitrate는 정수여야 합니다. CAN 프레임 설정을 확인하세요.", "err")
+                    return
 
         self.active = n
         self.scn_total = n
@@ -617,21 +662,26 @@ class RCubeApp:
         # 고정형은 BLE 분기만 허브가 취합한다(CAN 분기는 PC가 직접). 완료 판정 기준이 다르다.
         self.scn_ble_nodes = ble_nodes
         self.scn_ble_members = max(0, len(ble_nodes) - 1) if fixed else max(0, n - 1)
+        # 상태 박스: 고정형은 저장 노드ID와 저장된 통신방식, 비고정형은 가상ID(연결 순서).
+        # 비고정형은 초기 구성 단계라 항상 BLE로 붙는다(기획서 7.1).
+        if fixed:
+            boxes = [(nid, "CAN" if nid in can_nodes else "BLE")
+                     for nid in sorted(ble_nodes + can_nodes)]
+        else:
+            boxes = [(vid, "BLE") for vid in range(1, n + 1)]
+        self._set_cube_boxes(boxes)
         self._paint_buttons()
 
         if fixed:
             self._log(f"[R{n}] 시작 — 고정형 재연결 (7.2-7) · BLE {ble_nodes} · CAN {can_nodes}", "scn")
+            can_only = bool(can_nodes) and not ble_nodes
             if can_nodes:
-                if self.can.is_connected:
-                    self._run_can_fixed(can_nodes)
-                else:
-                    self._log("[고정형/CAN] CAN 큐브가 있으나 버스 미열림 — CAN 프레임에서 "
-                              "'열기' 후 다시 시도하세요(BLE 분기는 계속 진행).", "err")
+                # CAN 분기만인 구성에서는 CAN 발견 결과가 곧 완료 판정이다.
+                self._run_can_fixed(can_nodes, complete_scenario=can_only, can_cfg=can_cfg)
             if ble_nodes:
                 self._run_scn(n, self._scn_start_fixed(ble_nodes))
-            else:
+            elif can_only:
                 self._log("[고정형] BLE 큐브가 없습니다 — CAN 분기만 진행합니다.", "scn")
-                self.ui_q.put(("scn_done", n))
         else:
             self._log(f"[R{n}] 시작 — 비고정형 초기 구성 (7.1) · 켜는 순서 = 가상 노드ID", "scn")
             self._run_scn(n, self._scn_start(n))
@@ -666,6 +716,7 @@ class RCubeApp:
         first = await self._find_cube("첫 큐브(가상1)")
         self.ui_q.put(("log", f"[검색] 발견: {first}"))
         await self.ble.connect(first.address)
+        self.ui_q.put(("cube_connected", 1))   # 가상1 = 허브
         # 2) 그 큐브를 가상1 색(Red)으로.
         await self.ble.send(build_set_led_solid(ADDR_HUB, RED))
         self.ui_q.put(("log", "[scn] 가상1 → 빨강 LED (BLE 허브 후보)"))
@@ -692,6 +743,7 @@ class RCubeApp:
                                       match=lambda r: _parse_nn(r.name) == hub)
         self.ui_q.put(("log", f"[검색] 발견: {found}"))
         await self.ble.connect(found.address)
+        self.ui_q.put(("cube_connected", hub))
         # 7.2-7 ★: 허브는 무조건 Red가 아니라 자기 노드ID 색으로 켜진다.
         await self.ble.send(build_set_led_solid(ADDR_HUB, NODE_RGB.get(hub, WHITE)))
         if count == 1:
@@ -710,6 +762,7 @@ class RCubeApp:
         self.active = None
         self.scn_done = False
         self.scn_members = 0
+        self._set_cube_boxes([])
         self._paint_buttons()
         self._set_status("● 대기")
         self._run(self.ble.disconnect())
@@ -729,12 +782,17 @@ class RCubeApp:
             # 고정형: 허브가 광고 노드ID를 그대로 가상ID로 쓰므로 연결 순서로 추측할 수 없다.
             # 색은 전원 연결된 뒤 노드ID 기준으로 한 번에 지정한다.
             self._log(f"[고정형/BLE] 멤버 {cur}/{target} 연결", "scn")
+            # 상태 박스는 허브가 노드ID 순으로 붙이는 순서를 따라 채운다(허브=index 0).
+            for member_idx in range(self.scn_members + 1, cur + 1):
+                if member_idx < len(self.scn_ble_nodes):
+                    self._mark_cube(self.scn_ble_nodes[member_idx])
         else:
             # 비고정형: 연결 순서 = 가상 노드ID (기획서 7.1-2). 허브=1, 멤버 k → k+1.
             for member_idx in range(self.scn_members + 1, cur + 1):
                 vid = member_idx + 1
                 self._log(f"[scn] 멤버{member_idx} 연결(가상ID {vid}) → "
                           f"{CUBE_COLORS.get(vid, vid)} LED", "scn")
+                self._mark_cube(vid)
                 self._run(self.ble.send(build_set_led_solid(vid, NODE_RGB.get(vid, WHITE))))
 
         self.scn_members = cur
@@ -773,6 +831,8 @@ class RCubeApp:
                         self.scn_done = True
                         self._paint_buttons()
                         self._log(f"[R{payload}] 완료", "scn")
+                elif kind == "cube_connected":
+                    self._mark_cube(int(payload))
                 elif kind == "scn_failed":
                     n, err = payload
                     self._log(f"[R{n}] 실패: {err}", "err")
@@ -780,6 +840,7 @@ class RCubeApp:
                         self.active = None
                         self.scn_done = False
                         self.scn_members = 0
+                        self._set_cube_boxes([])
                         self._paint_buttons()
                     self._run(self.ble.disconnect())
                 elif kind == "error":
@@ -1201,7 +1262,8 @@ class RCubeApp:
             return None
 
     # ---- 고정형 CAN 분기 (기획서 7.2-7 [CAN 분기]) ----
-    def _run_can_fixed(self, can_nodes: list) -> None:
+    def _run_can_fixed(self, can_nodes: list, complete_scenario: bool = False,
+                       can_cfg=None) -> None:
         def per(nid, index):
             rgb = NODE_RGB.get(nid, (255, 255, 255))
             try:
@@ -1209,14 +1271,39 @@ class RCubeApp:
             except Exception:
                 pass
             self.ui_q.put(("log", f"[고정형/CAN] 노드 0x{nid:02X} 연결(순서 {index + 1})"))
+            self.ui_q.put(("cube_connected", nid))
 
         def work():
+            # 버스가 닫혀 있으면 알아서 연다 — CAN 분기는 어댑터 없이는 시작조차 못 하므로
+            # 사용자가 'CAN 열기'를 따로 누르게 할 이유가 없다(기획서 7.2-7은 PC가 CAN
+            # 분기를 직접 취합한다고만 정한다).
+            if not self.can.is_connected:
+                if can_cfg is None:
+                    self.ui_q.put(("log", "[CAN] 버스가 닫혀 있습니다 — CAN 프레임에서 '열기'를 "
+                                          "누르세요."))
+                    return
+                iface, chan, br = can_cfg
+                self.ui_q.put(("log", f"[CAN] 버스 자동 열기… ({iface}/{chan} @{br})"))
+                try:
+                    self.can.open(iface, chan, br)
+                except Exception as e:
+                    self.ui_q.put(("log", f"[CAN] 자동 열기 실패: {e!r} — 어댑터 연결과 채널을 "
+                                          f"확인하세요. PCAN-View가 떠 있으면 채널을 점유하므로 "
+                                          f"먼저 종료해야 합니다."))
+                    if complete_scenario:
+                        self.ui_q.put(("scn_failed", (scn_n, "CAN 버스를 열지 못했습니다")))
+                    return
+
             found = self.can.connect_ordered(3.0, per_node=per)
             missing = [n for n in can_nodes if n not in found]
             msg = f"[고정형/CAN] 발견 {[hex(n) for n in found]}"
             if missing:
                 msg += f" · 미발견 {[hex(n) for n in missing]}(전원/버스 확인)"
             self.ui_q.put(("log", msg))
+            # 완료는 담당 노드를 전부 찾았을 때만. 못 찾았는데 완료로 두면 이어지는
+            # 네트워크 설정·센서·모터가 없는 큐브를 대상으로 열린다.
+            if complete_scenario and not missing:
+                self.ui_q.put(("scn_done", self.scn_total))
         threading.Thread(target=work, daemon=True).start()
 
     async def _save_netconf_coro(self, n: int, choices: dict, term: int, edge: bool) -> None:
@@ -1337,7 +1424,11 @@ class RCubeApp:
         threading.Thread(target=work, daemon=True).start()
 
     def on_can_connect_ordered(self) -> None:
-        """고정형 CAN 연결(기획서 7.2 CAN 분기): 하트비트로 노드 발견 → 노드ID 순서대로 연결."""
+        """고정형 CAN 연결(기획서 7.2 CAN 분기): 하트비트로 노드 발견 → 노드ID 순서대로 연결.
+
+        can_cfg=(interface, channel, bitrate)를 주면 버스가 닫혀 있을 때 스스로 연다.
+        """
+        scn_n = self.scn_total
         if not self.can.is_connected:
             self._log("[CAN] 먼저 버스를 여세요.", "err")
             return
