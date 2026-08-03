@@ -28,9 +28,13 @@ static const char *TAG = "can";
 
 #define HEARTBEAT_MS 1000
 
+/* 상위가 이만큼 조용했다가 다시 말을 걸면 "새 연결"로 보고 연결음을 울린다. */
+#define MASTER_QUIET_US (3 * 1000 * 1000)
+
 static uint8_t s_node_id;
 static uint8_t s_term_id;
 static bool s_running;
+static int64_t s_last_master_us;   /* 상위(마스터) 프레임을 마지막으로 받은 시각 */
 
 /* ---- edge central(ECF=1)의 CAN 멤버 대기 상태 (기획서 7.4-4) ---- */
 static bool    s_edge;                       /* CAN 멤버 대기 중 */
@@ -334,6 +338,30 @@ static void rx_task(void *arg)
         uint8_t op  = RCUBE_CAN_OPCODE(id);
         uint8_t dst = RCUBE_CAN_DST(id);
         uint8_t src = RCUBE_CAN_SRC(id);
+
+        /* 상위(PC USB-CAN 또는 edge central)가 나에게 말을 걸었다 = 연결됐다.
+         * CAN에는 BLE의 GAP CONNECT 같은 이벤트가 없으므로, "마스터가 보낸 프레임"
+         * 또는 "내 노드ID로 개별 지정된 프레임"의 수신을 연결 성립으로 본다.
+         * 고정형 큐브는 자기 노드ID를 이미 알고 있으므로 그 색으로 상시 점등한다
+         * (기획서 5장 [LED] · 7.2-7 [CAN 분기] — 상위는 확인만 한다).
+         * 하트비트/부팅알림은 다른 멤버가 브로드캐스트한 것이라 제외한다.
+         *
+         * 연결음은 "조용하다가 다시 말을 걸어온" 순간마다 울린다. CAN에는 끊김
+         * 이벤트가 없어 한 번 LINKED가 되면 영영 유지되므로, 그것만 기준으로 삼으면
+         * 두 번째 연결부터는 소리가 나지 않는다(PC에서 R3를 다시 눌러도 무음).
+         * 상위는 연결 시 프레임을 몰아서 보내므로, 한 번의 연결 절차에 한 번만 울린다. */
+        if (op != RCUBE_OP_Heartbeat && op != RCUBE_OP_NodeAnnounce &&
+            (src == RCUBE_CAN_SRC_MASTER || dst == s_node_id)) {
+            int64_t now = esp_timer_get_time();
+            bool reconnected = (now - s_last_master_us) > MASTER_QUIET_US;
+            s_last_master_us = now;
+            if (reconnected || rcube_status_mode() != RCUBE_LED_LINKED) {
+                rcube_status_set_mode(RCUBE_LED_LINKED);
+                rcube_buzzer_play(RCUBE_MELODY_LINK);
+                ESP_LOGI(TAG, "상위 연결(src=0x%02x dst=0x%02x op=0x%02x) → 연결음 + 노드ID 색 점등",
+                         src, dst, op);
+            }
+        }
 
         /* edge central: 멤버의 부팅 알림/하트비트로 존재를 확인한다(7.4-4).
          * 이 두 프레임은 브로드캐스트로 오므로 아래 대상 필터보다 먼저 본다. */
