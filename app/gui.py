@@ -44,6 +44,7 @@ from rcube import (
     build_set_aggregator,
     build_set_group,
     build_get_node_config,
+    build_master_heartbeat,
     build_reset_config,
     build_member_map,
     build_set_edge_central,
@@ -177,6 +178,7 @@ class RCubeApp:
         self.scn_fixed = False    # 이번 시나리오가 고정형 재연결인지(시작 시 캡처)
         self.scn_ble_nodes = []   # 고정형: BLE로 세팅된 노드ID 목록(오름차순)
         self.scn_ble_members = 0  # 허브가 취합해야 할 BLE 멤버 수(= BLE 큐브 수 - 1)
+        self.scn_branch_ok = {"can": True, "ble": True}   # 고정형 분기별 완료 여부
         self._ts_reply = None     # TimeSync 왕복 회신 (notify → _timesync_coro)
 
         root.title("R-Cube 제어 (BLE / CAN)")
@@ -185,6 +187,7 @@ class RCubeApp:
 
         self._build_ui()
         self.root.after(self.POLL_MS, self._pump_ui)
+        self.root.after(1000, self._can_keepalive)   # CAN 연결 유지 하트비트
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # =====================================================================
@@ -232,6 +235,9 @@ class RCubeApp:
         self.cube_rowf = ttk.Frame(scn)
         self.cube_rowf.grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 4))
         self.cube_boxes: dict[int, tk.Label] = {}
+        self.cube_cmf_labels: dict[int, ttk.Label] = {}   # 박스 아래 통신방식 글씨
+        self.cube_ids: list[int] = []                     # 이번 시나리오의 큐브 ID 목록
+        self.cube_cmf: dict[int, int] = {}                # 큐브ID → 저장 CMF(0=BLE/1=CAN)
 
         self.status_var = tk.StringVar(value="● 대기")
         self.status_lbl = ttk.Label(scn, textvariable=self.status_var)
@@ -552,20 +558,81 @@ class RCubeApp:
         for w in self.cube_rowf.winfo_children():
             w.destroy()
         self.cube_boxes.clear()
+        self.cube_cmf_labels.clear()
         for col, (cube_id, cmf) in enumerate(entries):
             cell = ttk.Frame(self.cube_rowf)
             cell.grid(row=0, column=col, padx=(0, 8))
             box = tk.Label(cell, text=f"{cube_id:02d}", width=4, height=2,
                            font=("", 10, "bold"), relief="raised", **BOX_IDLE)
             box.grid(row=0, column=0)
-            ttk.Label(cell, text=cmf, font=("", 7)).grid(row=1, column=0)
+            sub = ttk.Label(cell, text=cmf, font=("", 7))
+            sub.grid(row=1, column=0)
             self.cube_boxes[cube_id] = box
+            self.cube_cmf_labels[cube_id] = sub
 
     def _mark_cube(self, cube_id: int) -> None:
         """해당 큐브를 '연결됨'(검정)으로 바꾼다."""
         box = self.cube_boxes.get(cube_id)
         if box is not None:
             box.configure(**BOX_DONE)
+
+    def _apply_cube_cmf(self, cube_id: int, cmf: int) -> None:
+        """큐브가 알려온 저장 통신방식을 상태 박스와 네트워크 설정 콤보에 반영한다."""
+        self.cube_cmf[cube_id] = cmf
+        text = "CAN" if cmf else "BLE"
+        sub = self.cube_cmf_labels.get(cube_id)
+        if sub is not None:
+            sub.configure(text=text)
+        cb = self.net_combos.get(cube_id)
+        if cb is not None:
+            cb.set(text)
+
+    def _direct_ble_cube(self) -> int:
+        """PC와 BLE로 직접 붙어 있는 큐브 ID — 그 큐브만 0xFE로 주고받는다.
+
+        혼합 구성에서는 유닛의 첫 큐브(cube_ids[0])가 아니라 BLE 분기의 최소 노드ID다.
+        예: 1·3=CAN, 2=BLE → PC에 붙은 것은 노드2이므로 0xFE는 노드2를 뜻한다.
+        """
+        if self.scn_fixed and self.scn_ble_nodes:
+            return self.scn_ble_nodes[0]
+        return self.cube_ids[0] if self.cube_ids else 1
+
+    def _query_cube_configs(self) -> None:
+        """각 큐브에 GetNodeConfig(D4)를 보내 저장된 통신방식을 읽어 온다.
+
+        네트워크 설정 콤보를 "지금 큐브에 저장된 값"으로 미리 선택해 두기 위한 것이다.
+        고정형은 netmap으로 이미 알지만 실제 큐브 값과 어긋났을 때(수동 변경·초기화)
+        조회 결과가 우선한다. 비고정형은 가상ID와 큐브의 대응을 앱이 모르므로 이 조회가
+        유일한 근거다. 회신은 _handle_notify의 GetNodeConfig 분기가 _apply_cube_cmf로
+        넘긴다.
+        """
+        for cid in self.cube_ids:
+            if self.cube_cmf.get(cid) == 1 and self.can.is_connected:
+                # CAN에서 0xFE는 "마스터에게"라는 뜻이라 큐브가 받지 않는다.
+                # 첫 큐브라도 실제 노드ID로 지목해야 한다.
+                try:
+                    self.can.send(build_get_node_config(target_id=cid))
+                except Exception as e:
+                    self._log(f"[설정조회/CAN] 큐브 {cid} 전송 실패: {e!r}", "err")
+            elif self.ble.is_connected:
+                direct = self._direct_ble_cube()
+                self._run(self.ble.send(
+                    build_get_node_config(target_id=ADDR_HUB if cid == direct else cid)))
+
+    def _can_keepalive(self) -> None:
+        """시나리오가 살아 있는 동안 1초마다 마스터 하트비트를 CAN에 뿌린다.
+
+        CAN에는 BLE의 disconnect 이벤트가 없다. 이 신호가 끊기면(앱 종료·버스 분리)
+        큐브가 상위는 사라졌다고 보고 지정색을 버린 뒤 미연결 점멸로 돌아간다
+        (펌웨어 can_transport의 master_watch). 즉 이 주기 송신이 곧 '연결 유지'다.
+        """
+        if (self.active is not None and self.can.is_connected
+                and any(v == 1 for v in self.cube_cmf.values())):
+            try:
+                self.can.send(build_master_heartbeat())
+            except Exception:
+                pass   # 버스가 막 닫혔을 수 있다 — 다음 주기에 조건이 걸러 준다
+        self.root.after(1000, self._can_keepalive)
 
     def _set_net_ui(self, n: int) -> None:
         """네트워크 설정 UI를 큐브 n개로 구성(0이면 안내문만). 안정 상태면 재구성 안 함."""
@@ -581,15 +648,21 @@ class RCubeApp:
             self.net_hint.grid(row=0, column=0, sticky="w")
             self.net_save_btn.configure(state="disabled")
             return
-        for vid in range(1, n + 1):
-            color = CUBE_COLORS.get(vid, f"vid{vid}")
-            ttk.Label(self.net_rows, text=f"큐브 {vid} ({color})").grid(
-                row=vid - 1, column=0, sticky="w", padx=(0, 8), pady=2)
+        # 행 순서는 상태 박스와 같은 큐브 ID 목록을 따른다(고정형=저장 노드ID,
+        # 비고정형=가상ID). 목록이 없으면 1..n으로 둔다.
+        ids = self.cube_ids if len(self.cube_ids) == n else list(range(1, n + 1))
+        for row, cid in enumerate(ids):
+            color = CUBE_COLORS.get(cid, f"vid{cid}")
+            ttk.Label(self.net_rows, text=f"큐브 {cid} ({color})").grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=2)
             cb = ttk.Combobox(self.net_rows, state="readonly", width=6, values=["BLE", "CAN"])
-            cb.set("BLE")   # 공장 기본
-            cb.grid(row=vid - 1, column=1, sticky="w", pady=2)
-            self.net_combos[vid] = cb
+            # 현재 큐브에 저장된 통신방식을 미리 선택해 둔다. 아직 모르면 공장 기본(BLE)로
+            # 두고, 아래 조회 회신이 오는 대로 덮어쓴다.
+            cb.set("CAN" if self.cube_cmf.get(cid) == 1 else "BLE")
+            cb.grid(row=row, column=1, sticky="w", pady=2)
+            self.net_combos[cid] = cb
         self.net_save_btn.configure(state="normal")
+        self._query_cube_configs()   # 실제 큐브 저장값으로 맞춘다
 
     # =====================================================================
     # 코루틴 실행 헬퍼
@@ -662,13 +735,21 @@ class RCubeApp:
         # 고정형은 BLE 분기만 허브가 취합한다(CAN 분기는 PC가 직접). 완료 판정 기준이 다르다.
         self.scn_ble_nodes = ble_nodes
         self.scn_ble_members = max(0, len(ble_nodes) - 1) if fixed else max(0, n - 1)
+        # 고정형 완료 판정: 두 분기가 각각 끝났는지. 없는 분기는 처음부터 완료로 둔다.
+        self.scn_branch_ok = {"can": not can_nodes, "ble": not ble_nodes}
         # 상태 박스: 고정형은 저장 노드ID와 저장된 통신방식, 비고정형은 가상ID(연결 순서).
         # 비고정형은 초기 구성 단계라 항상 BLE로 붙는다(기획서 7.1).
         if fixed:
-            boxes = [(nid, "CAN" if nid in can_nodes else "BLE")
-                     for nid in sorted(ble_nodes + can_nodes)]
+            self.cube_ids = sorted(ble_nodes + can_nodes)
+            # 저장된 매핑을 그대로 안다 — 네트워크 설정 콤보의 초기 선택값이 된다.
+            self.cube_cmf = {nid: (1 if nid in can_nodes else 0) for nid in self.cube_ids}
         else:
-            boxes = [(vid, "BLE") for vid in range(1, n + 1)]
+            # 비고정형은 가상ID와 큐브 저장값의 대응을 아직 모른다. 연결이 끝나면
+            # D4(GetNodeConfig)로 각 큐브에 직접 물어 채운다(_query_cube_configs).
+            self.cube_ids = list(range(1, n + 1))
+            self.cube_cmf = {}
+        boxes = [(cid, "CAN" if self.cube_cmf.get(cid) == 1 else
+                       "BLE" if cid in self.cube_cmf else "…") for cid in self.cube_ids]
         self._set_cube_boxes(boxes)
         self._paint_buttons()
 
@@ -748,7 +829,7 @@ class RCubeApp:
         await self.ble.send(build_set_led_solid(ADDR_HUB, NODE_RGB.get(hub, WHITE)))
         if count == 1:
             self.ui_q.put(("log", "[고정형/BLE] 단일 BLE 큐브 연결 완료"))
-            self.ui_q.put(("scn_done", self.scn_total))
+            self.ui_q.put(("branch_done", "ble"))
             return
         # 허브에 "BLE로 세팅된 큐브 수"를 전달. ordered=True → 가상ID = 광고 노드ID(NN).
         await self.ble.send(build_set_aggregator(count, group_enabled=False, ordered=True))
@@ -762,6 +843,8 @@ class RCubeApp:
         self.active = None
         self.scn_done = False
         self.scn_members = 0
+        self.cube_ids = []
+        self.cube_cmf = {}
         self._set_cube_boxes([])
         self._paint_buttons()
         self._set_status("● 대기")
@@ -799,8 +882,12 @@ class RCubeApp:
         if self.scn_members < target:
             return
 
-        self.scn_done = True
-        self._paint_buttons()
+        if self.scn_fixed:
+            # 혼합 구성이면 CAN 분기도 끝나야 완료다 — join은 _pump_ui가 판정한다.
+            self.ui_q.put(("branch_done", "ble"))
+        else:
+            self.scn_done = True
+            self._paint_buttons()
         if self.scn_fixed:
             # 각 BLE 멤버에 자기 노드ID 색 전송(허브가 target=노드ID로 중계).
             for nid in self.scn_ble_nodes[1:]:
@@ -833,6 +920,35 @@ class RCubeApp:
                         self._log(f"[R{payload}] 완료", "scn")
                 elif kind == "cube_connected":
                     self._mark_cube(int(payload))
+                elif kind == "scn_reset":
+                    # 저장(재부팅)·전원끄기처럼 전 큐브가 사라지는 동작 뒤에는 시나리오를
+                    # 접어야 한다. CAN에는 BLE 같은 disconnect 이벤트가 없어서, 이 신호가
+                    # 없으면 R버튼이 계속 진행중으로 남고 네트워크 설정도 열린 채 있는다.
+                    if self.active is not None:
+                        self._log(f"[R{self.active}] {payload} — 초기 상태로", "scn")
+                        self.active = None
+                        self.scn_done = False
+                        self.scn_members = 0
+                        self.cube_ids = []
+                        self.cube_cmf = {}
+                        self._set_cube_boxes([])
+                        self._paint_buttons()
+                        self._set_status("● 대기")
+                        if self.ble.is_connected:
+                            self._run(self.ble.disconnect())
+                elif kind == "netmap_save":
+                    # 저장 명령이 실제로 나간 뒤에 앱의 매핑을 갱신한다(코루틴 → UI 스레드).
+                    self._save_netmap(*payload)
+                elif kind == "branch_done":
+                    # 고정형은 CAN 분기와 BLE 분기가 따로 진행된다. 둘 다 끝나야 완료다
+                    # (한쪽만 보고 완료로 두면 나머지가 빠진 채 네트워크 설정이 열린다).
+                    self.scn_branch_ok[str(payload)] = True
+                    self._log(f"[고정형] {str(payload).upper()} 분기 완료", "scn")
+                    if self.active is not None and not self.scn_done \
+                            and all(self.scn_branch_ok.values()):
+                        self.scn_done = True
+                        self._paint_buttons()
+                        self._log(f"[R{self.active}] 완료 — 전 분기 연결", "scn")
                 elif kind == "scn_failed":
                     n, err = payload
                     self._log(f"[R{n}] 실패: {err}", "err")
@@ -840,6 +956,8 @@ class RCubeApp:
                         self.active = None
                         self.scn_done = False
                         self.scn_members = 0
+                        self.cube_ids = []
+                        self.cube_cmf = {}
                         self._set_cube_boxes([])
                         self._paint_buttons()
                     self._run(self.ble.disconnect())
@@ -904,6 +1022,18 @@ class RCubeApp:
             kind = "고정형" if node else "비고정형"
             self._log(f"    └ [설정] {who}: 그룹={g} 노드ID={node}({kind}) "
                       f"통신={'CAN' if cmf else 'BLE'} 종단노드={term}", "scn")
+            # 상태 박스·네트워크 설정 콤보를 실제 저장값으로 맞춘다.
+            # 어느 큐브의 회신인지 고르는 순서:
+            #   1) 고정형이면 회신에 실린 노드ID가 가장 확실하다(박스도 노드ID로 매긴다)
+            #   2) 0xFE로 온 것은 PC와 BLE로 직접 붙은 큐브의 회신
+            #   3) 그 외에는 허브가 재기입한 발신 큐브 ID
+            if self.scn_fixed and node:
+                cid = node
+            elif fr.target_id == ADDR_HUB:
+                cid = self._direct_ble_cube()
+            else:
+                cid = fr.target_id
+            self._apply_cube_cmf(cid, 1 if cmf else 0)
             return
         if fr.op_code == int(OpCode.GetEdgeCentralConfig) and len(fr.payload) >= 3 + MAX_NODES:
             ecf, unit_n, term = fr.payload[0], fr.payload[1], fr.payload[2]
@@ -926,6 +1056,9 @@ class RCubeApp:
             self.active = None
             self.scn_done = False
             self.scn_members = 0
+            self.cube_ids = []
+            self.cube_cmf = {}
+            self._set_cube_boxes([])
             self._paint_buttons()
 
     # =====================================================================
@@ -1202,20 +1335,21 @@ class RCubeApp:
         if self.active is None or not self.scn_done:
             self._log("[네트워크] 모든 큐브가 연결 완료된 뒤 저장하세요.", "err")
             return
-        if not self.ble.is_connected:
-            self._log("[네트워크] 연결이 없습니다.", "err")
-            return
+        # ※ 여기서 BLE 연결을 일괄로 요구하면 안 된다 — CAN 전용 구성(전 큐브 CMF=CAN)은
+        #   BLE 연결이 아예 없다. 필요한 전송로는 아래에서 큐브별 현재 CMF로 따진다.
         n = self.scn_total
+        # 대상 ID는 네트워크 설정 행과 같은 목록을 쓴다(고정형=저장 노드ID, 비고정형=가상ID).
+        ids = self.cube_ids if len(self.cube_ids) == n else list(range(1, n + 1))
         choices: dict[int, int] = {}
         can_vids = []
-        for vid in range(1, n + 1):
-            cb = self.net_combos.get(vid)
+        for cid in ids:
+            cb = self.net_combos.get(cid)
             cmf = 1 if (cb is not None and cb.get() == "CAN") else 0
-            choices[vid] = cmf
+            choices[cid] = cmf
             if cmf == 1:
-                can_vids.append(vid)
+                can_vids.append(cid)
         term = max(can_vids) if can_vids else 0
-        desc = ", ".join(f"{vid}:{'CAN' if choices[vid] else 'BLE'}" for vid in range(1, n + 1))
+        desc = ", ".join(f"{cid}:{'CAN' if choices[cid] else 'BLE'}" for cid in ids)
         edge = bool(self.edge_var.get())
 
         if edge and not messagebox.askyesno(
@@ -1228,15 +1362,27 @@ class RCubeApp:
                 "진행할까요?"):
             return
 
-        # 기획서 7.2 step3: PC가 nodeID→CMF 매핑 테이블을 자기 메모리에 저장(고정형 재연결 근거).
-        # 7.3에서는 이 표가 곧 edge central에 저장할 "멤버 맵"의 원본이다.
-        self._save_netmap(n, choices, term)
+        # ★저장 명령은 "지금의" 통신방식으로 나가야 한다. 바뀐 방식은 재부팅 후에나
+        #   유효하므로, 현재 큐브별 CMF(cube_cmf)와 지금 PC에 직접 붙어 있는 큐브를
+        #   캡처해 전송 경로를 정한다. 매핑 파일 갱신은 전송이 끝난 뒤에 한다
+        #   (실패했는데 앱만 새 구성을 기억하면 다음 고정형 연결이 어긋난다).
+        cur_cmf = dict(self.cube_cmf)
+        direct_ble = self._direct_ble_cube()
+        need_ble = any(cur_cmf.get(cid, 0) == 0 for cid in ids)
+        need_can = any(cur_cmf.get(cid, 0) == 1 for cid in ids)
+        if need_ble and not self.ble.is_connected:
+            self._log("[네트워크] BLE 큐브가 있는데 BLE 연결이 없습니다.", "err")
+            return
+        if need_can and not self.can.is_connected:
+            self._log("[네트워크] CAN 큐브가 있는데 CAN 버스가 열려 있지 않습니다.", "err")
+            return
+
         if edge:
             self._log(f"[독립] 저장 [{desc}] 종단노드={term} → 노드01에 ECF=1·멤버맵 저장 후 "
                       f"전체 전원끄기(7.3)", "scn")
         else:
             self._log(f"[네트워크] 저장 [{desc}] 종단노드={term} → 각 큐브 저장 후 전체 재부팅(연결 끊김)", "scn")
-        self._run(self._save_netconf_coro(n, choices, term, edge))
+        self._run(self._save_netconf_coro(ids, choices, term, edge, cur_cmf, direct_ble))
 
     def _save_netmap(self, n: int, choices: dict, term: int) -> None:
         try:
@@ -1302,47 +1448,77 @@ class RCubeApp:
             self.ui_q.put(("log", msg))
             # 완료는 담당 노드를 전부 찾았을 때만. 못 찾았는데 완료로 두면 이어지는
             # 네트워크 설정·센서·모터가 없는 큐브를 대상으로 열린다.
-            if complete_scenario and not missing:
-                self.ui_q.put(("scn_done", self.scn_total))
+            # 혼합 구성에서는 BLE 분기까지 끝나야 시나리오가 완료된다(_pump_ui의 join).
+            if not missing:
+                self.ui_q.put(("branch_done", "can"))
         threading.Thread(target=work, daemon=True).start()
 
-    async def _save_netconf_coro(self, n: int, choices: dict, term: int, edge: bool) -> None:
+    async def _save_netconf_coro(self, ids: list, choices: dict, term: int, edge: bool,
+                                 cur_cmf: dict, direct_ble: int) -> None:
+        n = len(ids)
+
+        async def send_to(cid: int, build):
+            """★지금(변경 전) 통신방식으로 그 큐브에 보낸다.
+
+            새 방식은 재부팅 후에나 유효하므로 저장 명령 자체는 기존 경로로 가야 한다.
+            혼합 구성(예: 1·3=CAN, 2=BLE)에서 전부 BLE로 보내면 CAN 큐브는 못 받는다.
+            CAN에서는 0xFE가 "마스터에게"라 큐브가 받지 않으므로 항상 실제 노드ID로 지목하고,
+            BLE에서는 PC에 직접 붙은 큐브만 0xFE로 보낸다(나머지는 허브가 중계).
+            """
+            if cur_cmf.get(cid, 0) == 1:
+                self.can.send(build(cid))
+            else:
+                await self.ble.send(build(ADDR_HUB if cid == direct_ble else cid))
+
+        async def broadcast(build):
+            """재부팅·전원끄기처럼 전 큐브 대상 명령은 살아 있는 두 버스 모두로 보낸다."""
+            if self.ble.is_connected:
+                await self.ble.send(build())
+            if self.can.is_connected:
+                self.can.send(build())
+
         # 0) 먼저 전 큐브의 ECF를 해제한다(멤버 맵도 삭제).
         #    이전 구성에서 edge central이었던 큐브가 섞여 있으면, 이번에 서브로봇유닛으로
         #    저장해도 그 큐브는 다음 부팅에서 다시 혼자 central이 되어 PC에 붙지 않는다.
         #    독립로봇유닛으로 저장하는 경우엔 아래 7.3-3 단계에서 리드 큐브만 ECF=1로 올린다.
         #    ※ D5는 term_id도 함께 쓰므로 1)의 SET_NETCONF보다 먼저 보낸다(term 보존).
         empty_map = build_member_map({})
-        for vid in range(1, n + 1):
-            target = ADDR_HUB if vid == 1 else vid
-            await self.ble.send(build_set_edge_central(0, 0, term, empty_map, target_id=target))
+        for cid in ids:
+            await send_to(cid, lambda t: build_set_edge_central(0, 0, term, empty_map,
+                                                                target_id=t))
         await asyncio.sleep(0.2)
         self.ui_q.put(("log", f"[네트워크] 전 큐브 ECF 해제(ECF=0 · 멤버맵 삭제) {n}대"))
 
-        # 1) 각 큐브에 통신방식 세팅 저장(재부팅 없이). vid1=허브(0xFE), 그 외=멤버 중계.
+        # 1) 각 큐브에 통신방식 세팅 저장(재부팅 없이).
         #    노드ID가 함께 저장되므로 이 시점에 고정형이 된다(기획서 7.5).
-        for vid in range(1, n + 1):
-            target = ADDR_HUB if vid == 1 else vid
-            await self.ble.send(build_set_netconf(vid, choices[vid], term, target_id=target))
-        await asyncio.sleep(0.2)
+        for cid in ids:
+            await send_to(cid, lambda t, c=cid: build_set_netconf(c, choices[c], term,
+                                                                  target_id=t))
+        await asyncio.sleep(0.3)
+
+        # 2) 전송이 끝난 뒤에야 앱의 매핑을 새 구성으로 갱신한다 — 다음 고정형 연결의 근거.
+        self.ui_q.put(("netmap_save", (n, choices, term)))
 
         if not edge:
-            # 7.2-4: 저장이 끝나면 전체 재부팅. 다음 부팅부터 고정형으로 재연결한다.
-            await self.ble.send(build_reboot_all())
+            # 7.2-4: 저장이 끝나면 전체 재부팅. 다음 부팅부터 새 통신방식으로 재연결한다.
+            await broadcast(build_reboot_all)
+            self.ui_q.put(("scn_reset", "전체 재부팅 — 연결 해제"))
             return
 
         # 7.3-3: 리드 큐브(노드01)에 ECF=1 + 전체 큐브 수 + 멤버 맵 + 종단노드ID를 저장.
         # (미션코드 업로드 F0~F2는 8장 확정 후 이 앞 단계에 들어간다.)
+        lead = ids[0]
         member_map = build_member_map(choices)
-        await self.ble.send(build_set_edge_central(1, n, term, member_map, target_id=ADDR_HUB))
+        await send_to(lead, lambda t: build_set_edge_central(1, n, term, member_map, target_id=t))
         await asyncio.sleep(0.3)
         # 저장 확인(D6 회신은 로그에 해석되어 찍힌다).
-        await self.ble.send(build_get_edge_central(target_id=ADDR_HUB))
+        await send_to(lead, lambda t: build_get_edge_central(target_id=t))
         await asyncio.sleep(0.3)
         # 7.3-4: 모든 큐브에 shut down. 배선을 독립유닛 형태로 정리한 뒤 다시 켠다.
-        await self.ble.send(build_shutdown())
+        await broadcast(build_shutdown)
         self.ui_q.put(("log", "[독립] 전원끄기 전송 — 배선 정리 후 리드 큐브부터 켜세요. "
                               "리드 큐브가 스스로 멤버를 연결합니다(7.4)."))
+        self.ui_q.put(("scn_reset", "전체 전원끄기 — 연결 해제"))
 
     def _debug_frame(self):
         """디버그 입력(Target/OpCode/payload)에서 표준 프레임을 만든다. 실패 시 None."""

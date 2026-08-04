@@ -186,6 +186,16 @@ def build_reboot_all(*, target_id: int = ADDR_BROADCAST) -> bytes:
     return build_frame(target_id, OpCode.SetNodeConfig, bytes((D3_SUB_REBOOT,)))
 
 
+def build_master_heartbeat(*, target_id: int = ADDR_BROADCAST) -> bytes:
+    """Heartbeat(0xD1) — PC(마스터)가 CAN 버스에 주기적으로 뿌리는 연결 유지 신호.
+
+    payload = [0xFE] (발신자 = 마스터). CAN에는 BLE의 disconnect 이벤트가 없어서,
+    큐브는 이 신호가 끊기는 것으로 상위가 사라졌음을 안다(펌웨어 can_transport의
+    master_watch). 큐브가 보내는 하트비트와 OpCode는 같고 CAN ID의 Src(0xFE)로 구분된다.
+    """
+    return build_frame(target_id, OpCode.Heartbeat, bytes((ADDR_HUB,)))
+
+
 def build_get_node_config(*, target_id: int = ADDR_HUB) -> bytes:
     """GetNodeConfig(0xD4). 저장된 설정을 조회한다.
 
