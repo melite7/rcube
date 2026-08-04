@@ -36,6 +36,7 @@ static uint8_t s_node_id;
 static uint8_t s_term_id;
 static bool s_running;
 static int64_t s_last_master_us;   /* 상위(마스터) 프레임을 마지막으로 받은 시각 */
+static uint8_t s_master_src;       /* 나를 연결한 상위의 SrcId (PC=0xFE, edge central=노드ID) */
 
 /* ---- edge central(ECF=1)의 CAN 멤버 대기 상태 (기획서 7.4-4) ---- */
 static bool    s_edge;                       /* CAN 멤버 대기 중 */
@@ -343,7 +344,12 @@ static void rx_task(void *arg)
         /* 상위(PC USB-CAN 또는 edge central) 생존 갱신 — 마스터가 보낸 것이거나
          * 내 노드ID로 개별 지정된 것. 마스터의 주기 하트비트도 여기 포함된다.
          * 이 시각이 끊기면 heartbeat_task의 감시가 미연결로 되돌린다. */
-        bool from_upper = (src == RCUBE_CAN_SRC_MASTER || dst == s_node_id);
+        /* 상위는 둘 중 하나다: PC(USB-CAN, Src=0xFE) 또는 edge central(Src=자기 노드ID).
+         * 후자는 0xFE를 쓰지 않으므로, 한 번 연결된 뒤에는 "나를 연결한 그 Src"의
+         * 프레임을 생존 신호로 본다 — edge central의 주기 하트비트가 그 역할을 한다
+         * (이게 없으면 독립유닛 멤버가 4초마다 끊긴 것으로 오판한다). */
+        bool from_upper = (src == RCUBE_CAN_SRC_MASTER || dst == s_node_id ||
+                           (s_master_src != 0 && src == s_master_src));
         if (from_upper) {
             s_last_master_us = esp_timer_get_time();
         }
@@ -355,6 +361,7 @@ static void rx_task(void *arg)
          * 그래야 상위의 주기 하트비트만으로 연결된 것처럼 보이지 않는다. */
         if (op != RCUBE_OP_Heartbeat && op != RCUBE_OP_NodeAnnounce && from_upper &&
             rcube_status_mode() != RCUBE_LED_LINKED) {
+            s_master_src = src;   /* 이후 이 Src의 프레임을 상위 생존 신호로 쓴다 */
             rcube_status_set_mode(RCUBE_LED_LINKED);
             rcube_buzzer_play(RCUBE_MELODY_LINK);
             ESP_LOGI(TAG, "상위 연결(src=0x%02x dst=0x%02x op=0x%02x) → 연결음 + 노드ID 색 점등",
@@ -458,6 +465,7 @@ static void master_watch(void)
         return;
     }
     s_last_master_us = 0;
+    s_master_src = 0;
     rcube_status_clear_color();
     rcube_status_exit_connect_mode();   /* 버튼으로 들어왔던 연결모드도 함께 푼다 */
     rcube_status_set_mode(RCUBE_LED_IDLE);
