@@ -181,6 +181,14 @@ bool rcube_status_enter_connect_mode(void)
     return true;
 }
 
+void rcube_status_exit_connect_mode(void)
+{
+    if (s_connect_entered) {
+        s_connect_entered = false;
+        ESP_LOGI(TAG, "연결모드 종료(대기모드) — 다음 버튼 누름이 다시 연결모드로 들어간다");
+    }
+}
+
 void rcube_status_enter_config_mode(void)
 {
     s_color_set = false;

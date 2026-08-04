@@ -54,6 +54,10 @@ void rcube_status_node_color(uint8_t node_id, uint8_t *r, uint8_t *g, uint8_t *b
 /* 짧게 누름 = 연결모드 진입. 최초 전환이면 true(진입 멜로디 재생용). */
 bool rcube_status_enter_connect_mode(void);
 
+/* 연결이 끊겨 대기모드로 돌아갈 때 호출한다. 위 래치를 풀어, 다음 버튼 누름이 다시
+ * 연결모드 진입으로 동작하게 한다(이게 없으면 재연결 버튼이 무시된다). */
+void rcube_status_exit_connect_mode(void);
+
 /* 길게(3초) 누름 = 설정모드. 흰색 0.25초 점멸을 연결 전까지 유지한다.
  * (상위가 붙으면 LINKED/HUB_WAIT로 넘어가고, 끊기면 다시 이 표시로 돌아온다.) */
 void rcube_status_enter_config_mode(void);

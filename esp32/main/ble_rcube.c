@@ -266,11 +266,21 @@ static int gap_event(struct ble_gap_event *event, void *arg)
          * 설정모드 자체는 재부팅 전까지 유지되고, LED만 연결 동안 양보한 것이다. */
         rcube_status_clear_color();
         if (s_config_name) {
+            /* 설정모드는 재부팅 전까지 유지된다(기획서 5장) → 광고를 계속한다. */
             rcube_status_enter_config_mode();
+            try_advertise();
         } else {
+            /* 연결모드는 연결이 끊기는 순간 끝난다 → 대기모드로 돌아가 광고를 멈춘다.
+             * 다시 붙이려면 BOOT 버튼을 눌러 연결모드에 넣어야 한다(기획서 5장 [버튼]).
+             * 광고를 계속 켜 두면 "버튼으로 연결모드 진입"이라는 규약이 무너져,
+             * 사용자가 의도하지 않은 시점에 상위가 붙어 버린다. */
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_start_requested = false;
+            xSemaphoreGive(s_lock);
+            rcube_status_exit_connect_mode();   /* 다음 버튼 누름이 다시 연결모드가 되도록 */
             rcube_status_set_mode(RCUBE_LED_IDLE);
+            ESP_LOGI(TAG, "연결모드 종료 → 대기모드(광고 중지). 재연결하려면 BOOT 버튼.");
         }
-        try_advertise();   /* 재연결을 위해 광고 재개 */
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
