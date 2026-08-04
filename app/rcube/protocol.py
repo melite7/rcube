@@ -316,7 +316,11 @@ def build_save_parameters(*, target_id: int = ADDR_HUB) -> bytes:
 MISSION_TYPE_TABLE = 1
 MISSION_HDR_LEN = 32
 MISSION_REC_LEN = 8
+MISSION_MAGIC = b"RCMS"
+MISSION_VER = 1
 MISSION_KIND_ANGLE = 0
+MISSION_KIND_TONE = 1     # value = [31:16] 주파수Hz(0=쉼) | [15:0] 길이ms
+MISSION_FLAG_REPEAT = 0x01
 
 MISSION_RUN, MISSION_STOP, MISSION_PAUSE, MISSION_RESUME = 1, 2, 3, 4
 MISSION_STATE = {0: "없음", 1: "적재됨", 2: "실행중"}
@@ -330,6 +334,79 @@ def build_mission_record(t_ms: int, node_id: int, angle_deg: float) -> bytes:
     """
     return (int(t_ms).to_bytes(2, "little") + bytes((node_id & 0xFF, MISSION_KIND_ANGLE)) +
             int(round(angle_deg * 100)).to_bytes(4, "little", signed=True))
+
+
+def build_mission_tone_record(t_ms: int, node_id: int, freq_hz: int, dur_ms: int) -> bytes:
+    """TYPE=1 TONE 키프레임 1개(8B). kind=1, value = 주파수<<16 | 길이ms.
+
+    "t_ms에 node_id 큐브가 freq_hz를 dur_ms 동안 낸다"는 뜻이다. 두 값을 한 레코드에
+    합쳐 넣는 이유는 8바이트 고정폭(=CAN 데이터필드 폭)을 유지하기 위해서다.
+    """
+    if not 0 <= int(freq_hz) <= 0xFFFF:
+        raise ValueError(f"주파수 범위(0~65535) 초과: {freq_hz}")
+    if not 1 <= int(dur_ms) <= 0xFFFF:
+        raise ValueError(f"길이 범위(1~65535 ms) 초과: {dur_ms}")
+    value = (int(freq_hz) << 16) | int(dur_ms)
+    return (int(t_ms).to_bytes(2, "little") + bytes((node_id & 0xFF, MISSION_KIND_TONE)) +
+            value.to_bytes(4, "little"))
+
+
+def mission_unit_sig(unit_count: int, member_map: bytes) -> int:
+    """유닛 서명 = CRC32([unit_n][member_map 8B]) — 펌웨어 rcube_mission_unit_sig()와 동일.
+
+    미션은 특정 유닛 구성에 종속이므로, 다른 구성에 올라가면 큐브가 실행을 거부한다
+    (확장 규격 §2.5.1). 0은 "검사 안 함".
+    """
+    import zlib   # esp_crc32_le(0,…)와 같은 표준 CRC-32
+    if len(member_map) != MAX_NODES:
+        raise ValueError(f"member_map은 {MAX_NODES}바이트여야 합니다: {len(member_map)}")
+    return zlib.crc32(bytes((unit_count & 0xFF,)) + bytes(member_map)) & 0xFFFFFFFF
+
+
+def build_mission_container(body: bytes, *, name: str = "", unit_sig: int = 0,
+                            n_nodes: int = 0, repeat: bool = False,
+                            mission_type: int = MISSION_TYPE_TABLE) -> bytes:
+    """헤더(32B) + 본문 = .rcm 파일 한 벌 (확장 규격 §2.5.1).
+
+    업로드할 때 큐브로 가는 것은 본문뿐이고 헤더는 큐브가 스스로 쓴다. 그래도 파일에는
+    헤더를 붙여 둔다 — 길이·CRC·유닛서명·이름을 파일만 보고 확인할 수 있어야 하고,
+    업로더(F0)가 그 값을 그대로 실어 보낼 수 있기 때문이다.
+    """
+    import zlib
+    if len(body) % MISSION_REC_LEN:
+        raise ValueError(f"본문이 {MISSION_REC_LEN}바이트 배수가 아닙니다: {len(body)}")
+    hdr = bytearray(MISSION_HDR_LEN)
+    hdr[0:4] = MISSION_MAGIC
+    hdr[4] = MISSION_VER
+    hdr[5] = mission_type & 0xFF
+    hdr[6] = MISSION_FLAG_REPEAT if repeat else 0
+    hdr[7] = n_nodes & 0xFF
+    hdr[8:12] = (unit_sig & 0xFFFFFFFF).to_bytes(4, "little")
+    hdr[12:16] = len(body).to_bytes(4, "little")
+    hdr[16:20] = (zlib.crc32(body) & 0xFFFFFFFF).to_bytes(4, "little")
+    hdr[20:32] = name.encode("ascii", "replace")[:MISSION_HDR_LEN - 20].ljust(12, b"\0")
+    return bytes(hdr) + bytes(body)
+
+
+def parse_mission_container(blob: bytes) -> dict:
+    """.rcm 파일을 헤더 dict + body로 나눈다. 형식이 아니면 ValueError."""
+    import zlib
+    if len(blob) < MISSION_HDR_LEN or blob[:4] != MISSION_MAGIC:
+        raise ValueError("RCMS 컨테이너가 아닙니다(magic 불일치)")
+    body_len = int.from_bytes(blob[12:16], "little")
+    body = blob[MISSION_HDR_LEN:MISSION_HDR_LEN + body_len]
+    if len(body) != body_len:
+        raise ValueError(f"본문이 잘렸습니다({len(body)}/{body_len} B)")
+    crc = int.from_bytes(blob[16:20], "little")
+    if zlib.crc32(body) & 0xFFFFFFFF != crc:
+        raise ValueError("본문 CRC 불일치 — 파일이 손상되었습니다")
+    return {
+        "ver": blob[4], "type": blob[5], "flags": blob[6], "n_nodes": blob[7],
+        "unit_sig": int.from_bytes(blob[8:12], "little"),
+        "body_len": body_len, "body_crc": crc,
+        "name": blob[20:32].split(b"\0")[0].decode("ascii", "replace"),
+        "body": body,
+    }
 
 
 def build_mission_upload_begin(total_len: int, crc32: int, unit_sig: int = 0,

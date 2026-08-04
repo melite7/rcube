@@ -5,6 +5,8 @@
 #include "rcube_motion.h"
 #include "rcube_mission.h"
 #include "ble_multirole.h"
+#include "can_transport.h"
+#include "rcube_buzzer.h"
 #include "board_led.h"
 
 #include <string.h>
@@ -308,6 +310,68 @@ int rcube_cmd_send_frame(const uint8_t *frame, uint16_t len)
     return reply_send(frame, len);
 }
 
+/* OpCode → CAN 우선순위 클래스(shared-protocol의 분류표). app/rcube/can.py와 같은 규칙. */
+static uint8_t can_priority_for(uint8_t op)
+{
+    if (op == RCUBE_OP_EmergencyStop)                       return RCUBE_PRI_ESTOP;
+    if (op == RCUBE_OP_Heartbeat || op == RCUBE_OP_TimeSync ||
+        op == RCUBE_OP_NodeAnnounce || op == RCUBE_OP_ExecuteBuffer) return RCUBE_PRI_SAFETY_SYNC;
+    if (op >= 0xC0 && op <= 0xCF)                           return RCUBE_PRI_MOTION;
+    if (op == RCUBE_OP_CmdAck || (op >= 0xB0 && op <= 0xB6)) return RCUBE_PRI_QUERY;
+    if ((op >= 0xE0 && op <= 0xE7) || (op >= 0xEA && op <= 0xED)) return RCUBE_PRI_PERIPHERAL;
+    if (op >= 0xF0 && op <= 0xF8)                           return RCUBE_PRI_MISSION_OTA;
+    if (op >= 0xD3 && op <= 0xDB)                           return RCUBE_PRI_CONFIG;
+    return RCUBE_PRI_QUERY;
+}
+
+/* 멤버 한 대에 명령을 보낸다 — 통신방식은 저장된 멤버 맵이 정한다(기획서 8장 중앙 제어).
+ *   CMF=CAN : CAN으로 그 노드ID에 직접 송신
+ *   CMF=BLE : edge central이 붙여 둔 GATT 연결로 중계(ble_multirole_forward)
+ * 자기 자신(노드ID가 나)이면 -1 — 호출부가 스스로 실행해야 한다. */
+#define SEND_NODE_MAX_PAYLOAD 32
+
+int rcube_cmd_send_to_node(uint8_t node_id, uint8_t op, const uint8_t *payload, uint16_t len)
+{
+    if (node_id == rcube_config_node_id() || len > SEND_NODE_MAX_PAYLOAD) {
+        return -1;
+    }
+    uint8_t cmf = rcube_config_member_cmf(node_id);
+    if (cmf == RCUBE_MEMBER_CAN) {
+        esp_err_t e = can_transport_send(can_priority_for(op), op, node_id, payload, len);
+        return (e == ESP_OK) ? 0 : -1;
+    }
+    if (cmf == RCUBE_MEMBER_BLE) {
+        if (s_ops.forward == NULL) {
+            return -1;
+        }
+        uint8_t f[HEADER_LEN + SEND_NODE_MAX_PAYLOAD];
+        uint16_t total = (uint16_t)(HEADER_LEN + len);
+        put_header(f, node_id, op, total);
+        if (len) {
+            memcpy(&f[HEADER_LEN], payload, len);
+        }
+        return s_ops.forward(node_id, f, total);
+    }
+    return -1;   /* 멤버 맵에 없는 노드 */
+}
+
+/* E6 GenerateBuzzerTone: payload = [freq_hz(u16 BE)][dur_ms(u16 BE)].
+ * 미션(TYPE=1)의 TONE 키프레임을 edge central이 각 멤버로 풀어 보낼 때 쓰는 명령이다.
+ * freq_hz=0은 무음, dur_ms=0은 무시. */
+static uint8_t handle_generate_tone(const uint8_t *p, uint16_t plen)
+{
+    if (plen < 4) {
+        return RCUBE_RC_BAD_LENGTH;
+    }
+    uint16_t freq = (uint16_t)((p[0] << 8) | p[1]);
+    uint16_t dur  = (uint16_t)((p[2] << 8) | p[3]);
+    if (dur == 0) {
+        return RCUBE_RC_BAD_PARAM;
+    }
+    rcube_buzzer_play_tone(freq, dur);
+    return RCUBE_RC_OK;
+}
+
 int rcube_cmd_sensor_stream_all(bool on, uint16_t period_ms)
 {
     /* 자기 자신부터 적용(허브/edge central도 유닛의 한 큐브다 — 9장 "자신의 데이터와 함께"). */
@@ -555,6 +619,11 @@ void rcube_cmd_on_frame(const uint8_t *data, uint16_t len)
 
     case RCUBE_OP_MissionControl:
         rc = (plen >= 1) ? rcube_mission_control(payload[0]) : RCUBE_RC_BAD_LENGTH;
+        reply_cmd_ack(op, rc);
+        break;
+
+    case RCUBE_OP_GenerateBuzzerTone:
+        rc = handle_generate_tone(payload, plen);
         reply_cmd_ack(op, rc);
         break;
 

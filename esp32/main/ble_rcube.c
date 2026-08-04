@@ -106,10 +106,16 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     case BLE_GATT_ACCESS_OP_WRITE_CHR: {
-        uint8_t buf[64];
+        /* ★ 이 버퍼가 곧 "받을 수 있는 최대 프레임"이다. 64B였을 때 미션 업로드
+         * (F1 = 헤더4 + seq2 + 본문 64 = 70B)가 통째로 거부됐다 — mbuf_to_flat이
+         * 실패하면 ATT는 0x0E(Unlikely Error)로 답할 뿐이라, PC에는 원인을 알 수 없는
+         * GATT 오류로만 보인다(2026-08-04 실사례). 협상 MTU(256) 상한에 맞춰 잡는다. */
+        uint8_t buf[RCUBE_BLE_MAX_FRAME];
         uint16_t len = 0;
         int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &len);
         if (rc != 0) {
+            ESP_LOGW(TAG, "GATT write %u바이트가 버퍼(%u)를 넘어 거부됨",
+                     (unsigned)OS_MBUF_PKTLEN(ctxt->om), (unsigned)sizeof(buf));
             return BLE_ATT_ERR_UNLIKELY;
         }
         /* 표준 프레임을 명령 레이어로 넘겨 파싱·디스패치(회신은 notify). */

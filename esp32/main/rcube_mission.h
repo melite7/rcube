@@ -33,6 +33,12 @@
 /* TYPE=1 키프레임 레코드(8바이트 고정폭). CAN 데이터필드와 폭이 같다. */
 #define RCUBE_MISSION_REC_LEN 8u
 #define RCUBE_MISSION_KIND_ANGLE 0u
+/* KIND=1 부저 톤. value = [31:16] 주파수Hz(0=쉼) | [15:0] 길이ms.
+ * 모터 없이도 유닛 전체의 동시 동작을 눈·귀로 검증할 수 있어, 독립로봇유닛
+ * 브링업(7.4-6)의 첫 미션으로 쓴다. */
+#define RCUBE_MISSION_KIND_TONE  1u
+#define RCUBE_MISSION_TONE_FREQ(v) ((uint16_t)(((uint32_t)(v) >> 16) & 0xFFFFu))
+#define RCUBE_MISSION_TONE_DUR(v)  ((uint16_t)((uint32_t)(v) & 0xFFFFu))
 
 /* 슬롯 1개 크기. storage 파티션(9.9MB)에 2개를 잡는다. */
 #define RCUBE_MISSION_SLOT_SIZE (512u * 1024u)
@@ -70,3 +76,9 @@ rcube_mission_state_t rcube_mission_state(void);
 
 /* 이 유닛의 서명. 컨테이너 unit_sig와 대조한다(0이면 검사 생략). */
 uint32_t rcube_mission_unit_sig(void);
+
+/* ---- 연결 완료 → 자동 실행 (기획서 7.4-6) ----
+ * edge central의 한 통신 분기(cmf: RCUBE_MEMBER_BLE / RCUBE_MEMBER_CAN)가 담당 멤버를
+ * 전부 연결했을 때 그 전송계층이 호출한다. 맵이 요구하는 분기가 모두 모이면 적재된
+ * 미션을 스스로 Run 시킨다(한 번만). ECF=0이거나 미션이 없으면 아무 일도 하지 않는다. */
+void rcube_mission_branch_ready(uint8_t cmf);

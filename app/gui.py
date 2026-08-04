@@ -23,10 +23,19 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 # 네트워크 세팅 매핑(nodeID→CMF) 저장 파일 (기획서 7.2 PC 매핑 테이블).
 NETMAP_PATH = Path(__file__).resolve().parent / "netmap.json"
+
+# 미션코드 소스(.py) 기본 폴더 — 기획서 7.3-2에서 사용자가 올리는 파일.
+MISSION_DIR = Path(__file__).resolve().parent / "missions"
+
+# 멜로디 테스트(임시) — 큐브가 아니라 PC 스피커로 재생한다.
+from melody import MelodyPlayer, load_melodies
+
+# 파이썬 미션 → 데이터 테이블(.rcm) 컴파일러 (기획서 8장 / 확장 규격 §2.5).
+from rcube.mission import compile_file
 
 from rcube import (
     OpCode,
@@ -75,6 +84,13 @@ from rcube import (
     MEMBER_CAN,
     build_set_netconf,
     build_reboot_all,
+    build_mission_upload_begin,
+    build_mission_upload_chunk,
+    build_mission_upload_commit,
+    build_get_mission_info,
+    parse_mission_info,
+    mission_unit_sig,
+    MISSION_STATE,
     parse_frame,
     ADDR_HUB,
     ADDR_BROADCAST,
@@ -185,6 +201,12 @@ class RCubeApp:
         root.geometry("680x780")
         root.minsize(580, 660)
 
+        # 멜로디 테스트(임시): 큐브와 무관하게 PC 스피커로만 재생한다.
+        # 창은 도구 메뉴에서 열고, 엑셀은 그때 처음 읽는다(앱 시작을 늦추지 않는다).
+        self.melodies: dict = {}
+        self.mel_win = None
+        self.melody_player = MelodyPlayer(on_log=lambda m: self.ui_q.put(("log", m)))
+
         self._build_ui()
         self.root.after(self.POLL_MS, self._pump_ui)
         self.root.after(1000, self._can_keepalive)   # CAN 연결 유지 하트비트
@@ -195,6 +217,14 @@ class RCubeApp:
     # =====================================================================
     def _build_ui(self) -> None:
         pad = dict(padx=6, pady=4)
+
+        # 메뉴 — 창 크기와 무관하게 늘 보이는 자리. 임시 도구는 여기에 둔다
+        # (본문 프레임에 넣으면 로그 패널에 밀려 화면 밖으로 잘린다).
+        menubar = tk.Menu(self.root)
+        tools = tk.Menu(menubar, tearoff=0)
+        tools.add_command(label="멜로디 테스트 (PC 스피커)…", command=self.open_melody_window)
+        menubar.add_cascade(label="도구", menu=tools)
+        self.root.config(menu=menubar)
 
         # 1) 시나리오 버튼
         scn = ttk.LabelFrame(self.root, text="시나리오 (R1=1대 · R2=2대 · R3=3대 · R4=4대)")
@@ -238,6 +268,10 @@ class RCubeApp:
         self.cube_cmf_labels: dict[int, ttk.Label] = {}   # 박스 아래 통신방식 글씨
         self.cube_ids: list[int] = []                     # 이번 시나리오의 큐브 ID 목록
         self.cube_cmf: dict[int, int] = {}                # 큐브ID → 저장 CMF(0=BLE/1=CAN)
+        # ★ 큐브ID → "지금 실제로 붙어 있는 경로"("ble"/"can"). 저장 CMF와 다를 수 있다:
+        #   설정모드(RCUBECONFIG)에서는 CMF=CAN 큐브도 BLE로 붙고, 비고정형 초기구성도
+        #   전부 BLE다. 명령을 저장 CMF로 보내면 그런 상황에서 아무 데도 닿지 않는다.
+        self.cube_route: dict[int, str] = {}
 
         self.status_var = tk.StringVar(value="● 대기")
         self.status_lbl = ttk.Label(scn, textvariable=self.status_var)
@@ -267,10 +301,18 @@ class RCubeApp:
         netright = ttk.Frame(netf)
         netright.pack(side="right", padx=8, pady=4)
         # 기획서 7.3-1: 체크하면 통신방식 세팅과 함께 리드 큐브(노드01)를 edge central로
-        # 만든다(ECF=1 + 멤버 맵 + N 저장). 미션코드 업로드는 8장에서 붙인다.
+        # 만든다(ECF=1 + 멤버 맵 + N 저장). 7.3-2: 체크하면 PC가 미션코드를 요청해
+        # 리드 큐브에 업로드한다(아래 미션코드 줄).
         self.edge_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(netright, text="독립로봇유닛",
                         variable=self.edge_var, command=self._paint_net_save).pack(anchor="e")
+        missf = ttk.Frame(netright)
+        missf.pack(anchor="e", pady=(2, 0))
+        self.mission_path: Path | None = None
+        self._mission_info = None      # 마지막 F3(GetMissionInfo) 회신 — 업로드 확인용
+        self.mission_var = tk.StringVar(value="미션코드: (없음)")
+        ttk.Label(missf, textvariable=self.mission_var).pack(side="left", padx=(0, 4))
+        ttk.Button(missf, text="선택…", width=6, command=self.on_pick_mission).pack(side="left")
         self.net_save_btn = tk.Button(netf, text="저장(재부팅)", command=self.on_save_netconf,
                                       state="disabled")
         self.net_save_btn.pack(side="right", padx=4, pady=4)
@@ -570,11 +612,24 @@ class RCubeApp:
             self.cube_boxes[cube_id] = box
             self.cube_cmf_labels[cube_id] = sub
 
-    def _mark_cube(self, cube_id: int) -> None:
-        """해당 큐브를 '연결됨'(검정)으로 바꾼다."""
+    def _mark_cube(self, cube_id: int, route: str = None) -> None:
+        """해당 큐브를 '연결됨'(검정)으로 바꾼다. route를 주면 실제 연결 경로도 기록한다."""
         box = self.cube_boxes.get(cube_id)
         if box is not None:
             box.configure(**BOX_DONE)
+        if route:
+            self.cube_route[cube_id] = route
+
+    def _route_of(self, cube_id: int) -> str:
+        """이 큐브에 지금 명령을 보낼 경로. 연결 때 기록한 값이 우선이고, 없으면 저장 CMF.
+
+        저장 CMF로 되돌아가는 것은 마지막 수단이다 — 설정모드처럼 "저장은 CAN인데 붙은
+        건 BLE"인 상황에서 저장 CMF를 믿으면 명령이 어디에도 닿지 않는다.
+        """
+        r = self.cube_route.get(cube_id)
+        if r:
+            return r
+        return "can" if self.cube_cmf.get(cube_id, 0) == 1 else "ble"
 
     def _apply_cube_cmf(self, cube_id: int, cmf: int) -> None:
         """큐브가 알려온 저장 통신방식을 상태 박스와 네트워크 설정 콤보에 반영한다."""
@@ -607,7 +662,8 @@ class RCubeApp:
         넘긴다.
         """
         for cid in self.cube_ids:
-            if self.cube_cmf.get(cid) == 1 and self.can.is_connected:
+            # 경로는 연결 때 기록한 실제 경로를 쓴다(설정모드에서는 CAN 큐브도 BLE로 붙는다).
+            if self._route_of(cid) == "can" and self.can.is_connected:
                 # CAN에서 0xFE는 "마스터에게"라는 뜻이라 큐브가 받지 않는다.
                 # 첫 큐브라도 실제 노드ID로 지목해야 한다.
                 try:
@@ -619,6 +675,64 @@ class RCubeApp:
                 self._run(self.ble.send(
                     build_get_node_config(target_id=ADDR_HUB if cid == direct else cid)))
 
+    # ---- 멜로디 테스트 (임시) — 도구 메뉴에서 여는 별도 창 ----
+    def open_melody_window(self) -> None:
+        """멜로디 테스트 창을 연다. 이미 열려 있으면 앞으로 가져온다."""
+        if self.mel_win is not None and self.mel_win.winfo_exists():
+            self.mel_win.lift()
+            self.mel_win.focus_force()
+            return
+        if not self.melodies:
+            try:
+                self.melodies = load_melodies()
+            except Exception as e:
+                self._log(f"[멜로디] 로드 실패: {e!r} — openpyxl과 docs 엑셀을 확인하세요.", "err")
+                messagebox.showerror("멜로디 테스트",
+                                     f"멜로디 데이터를 읽지 못했습니다.\n\n{e!r}\n\n"
+                                     f"app\\.venv\\Scripts\\python.exe 로 실행했는지 확인하세요.")
+                return
+
+        win = tk.Toplevel(self.root)
+        win.title("멜로디 테스트 (PC 스피커 · 임시)")
+        win.transient(self.root)
+        win.resizable(False, False)
+        self.mel_win = win
+
+        names = list(self.melodies)
+        ttk.Label(win, text="곡").grid(row=0, column=0, sticky="e", padx=(10, 4), pady=10)
+        self.mel_cb = ttk.Combobox(win, state="readonly", width=34, values=names)
+        self.mel_cb.grid(row=0, column=1, sticky="w", pady=10)
+        self.mel_cb.bind("<<ComboboxSelected>>", lambda _e: self._show_melody_info())
+        ttk.Button(win, text="재생", command=self.on_melody_play).grid(row=0, column=2, padx=4)
+        ttk.Button(win, text="정지", command=self.on_melody_stop).grid(row=0, column=3, padx=(0, 10))
+
+        self.mel_info_var = tk.StringVar()
+        ttk.Label(win, textvariable=self.mel_info_var).grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 4))
+        ttk.Label(win, text="※ 큐브에는 아무것도 보내지 않습니다. PC 스피커로만 재생합니다.",
+                  foreground="#888").grid(row=2, column=0, columnspan=4, sticky="w",
+                                          padx=10, pady=(0, 10))
+        if names:
+            self.mel_cb.set(names[0])
+            self._show_melody_info()
+
+    def _show_melody_info(self) -> None:
+        notes = self.melodies.get(self.mel_cb.get(), [])
+        if notes:
+            self.mel_info_var.set(
+                f"{len(notes)}음 · {sum(d for _, d in notes):.2f}초 · 전체 {len(self.melodies)}곡")
+
+    def on_melody_play(self) -> None:
+        name = self.mel_cb.get()
+        notes = self.melodies.get(name)
+        if not notes:
+            self._log("[멜로디] 재생할 곡을 고르세요.", "err")
+            return
+        self.melody_player.play(name, notes)
+
+    def on_melody_stop(self) -> None:
+        self.melody_player.stop()
+
     def _can_keepalive(self) -> None:
         """시나리오가 살아 있는 동안 1초마다 마스터 하트비트를 CAN에 뿌린다.
 
@@ -627,7 +741,7 @@ class RCubeApp:
         (펌웨어 can_transport의 master_watch). 즉 이 주기 송신이 곧 '연결 유지'다.
         """
         if (self.active is not None and self.can.is_connected
-                and any(v == 1 for v in self.cube_cmf.values())):
+                and any(r == "can" for r in self.cube_route.values())):
             try:
                 self.can.send(build_master_heartbeat())
             except Exception:
@@ -739,6 +853,8 @@ class RCubeApp:
         self.scn_branch_ok = {"can": not can_nodes, "ble": not ble_nodes}
         # 상태 박스: 고정형은 저장 노드ID와 저장된 통신방식, 비고정형은 가상ID(연결 순서).
         # 비고정형은 초기 구성 단계라 항상 BLE로 붙는다(기획서 7.1).
+        # 실제 연결 경로는 이번 시나리오에서 다시 채운다(연결될 때마다 _mark_cube가 기록).
+        self.cube_route = {}
         if fixed:
             self.cube_ids = sorted(ble_nodes + can_nodes)
             # 저장된 매핑을 그대로 안다 — 네트워크 설정 콤보의 초기 선택값이 된다.
@@ -797,7 +913,7 @@ class RCubeApp:
         first = await self._find_cube("첫 큐브(가상1)")
         self.ui_q.put(("log", f"[검색] 발견: {first}"))
         await self.ble.connect(first.address)
-        self.ui_q.put(("cube_connected", 1))   # 가상1 = 허브
+        self.ui_q.put(("cube_connected", (1, "ble")))   # 가상1 = 허브
         # 2) 그 큐브를 가상1 색(Red)으로.
         await self.ble.send(build_set_led_solid(ADDR_HUB, RED))
         self.ui_q.put(("log", "[scn] 가상1 → 빨강 LED (BLE 허브 후보)"))
@@ -824,7 +940,7 @@ class RCubeApp:
                                       match=lambda r: _parse_nn(r.name) == hub)
         self.ui_q.put(("log", f"[검색] 발견: {found}"))
         await self.ble.connect(found.address)
-        self.ui_q.put(("cube_connected", hub))
+        self.ui_q.put(("cube_connected", (hub, "ble")))
         # 7.2-7 ★: 허브는 무조건 Red가 아니라 자기 노드ID 색으로 켜진다.
         await self.ble.send(build_set_led_solid(ADDR_HUB, NODE_RGB.get(hub, WHITE)))
         if count == 1:
@@ -845,6 +961,7 @@ class RCubeApp:
         self.scn_members = 0
         self.cube_ids = []
         self.cube_cmf = {}
+        self.cube_route = {}
         self._set_cube_boxes([])
         self._paint_buttons()
         self._set_status("● 대기")
@@ -868,14 +985,14 @@ class RCubeApp:
             # 상태 박스는 허브가 노드ID 순으로 붙이는 순서를 따라 채운다(허브=index 0).
             for member_idx in range(self.scn_members + 1, cur + 1):
                 if member_idx < len(self.scn_ble_nodes):
-                    self._mark_cube(self.scn_ble_nodes[member_idx])
+                    self._mark_cube(self.scn_ble_nodes[member_idx], "ble")
         else:
             # 비고정형: 연결 순서 = 가상 노드ID (기획서 7.1-2). 허브=1, 멤버 k → k+1.
             for member_idx in range(self.scn_members + 1, cur + 1):
                 vid = member_idx + 1
                 self._log(f"[scn] 멤버{member_idx} 연결(가상ID {vid}) → "
                           f"{CUBE_COLORS.get(vid, vid)} LED", "scn")
-                self._mark_cube(vid)
+                self._mark_cube(vid, "ble")
                 self._run(self.ble.send(build_set_led_solid(vid, NODE_RGB.get(vid, WHITE))))
 
         self.scn_members = cur
@@ -919,7 +1036,9 @@ class RCubeApp:
                         self._paint_buttons()
                         self._log(f"[R{payload}] 완료", "scn")
                 elif kind == "cube_connected":
-                    self._mark_cube(int(payload))
+                    # payload = (큐브ID, 경로) — 예전 형태(정수)도 받아 준다.
+                    cid, route = payload if isinstance(payload, tuple) else (payload, None)
+                    self._mark_cube(int(cid), route)
                 elif kind == "scn_reset":
                     # 저장(재부팅)·전원끄기처럼 전 큐브가 사라지는 동작 뒤에는 시나리오를
                     # 접어야 한다. CAN에는 BLE 같은 disconnect 이벤트가 없어서, 이 신호가
@@ -931,6 +1050,7 @@ class RCubeApp:
                         self.scn_members = 0
                         self.cube_ids = []
                         self.cube_cmf = {}
+                        self.cube_route = {}
                         self._set_cube_boxes([])
                         self._paint_buttons()
                         self._set_status("● 대기")
@@ -958,6 +1078,7 @@ class RCubeApp:
                         self.scn_members = 0
                         self.cube_ids = []
                         self.cube_cmf = {}
+                        self.cube_route = {}
                         self._set_cube_boxes([])
                         self._paint_buttons()
                     self._run(self.ble.disconnect())
@@ -1035,6 +1156,20 @@ class RCubeApp:
                 cid = fr.target_id
             self._apply_cube_cmf(cid, 1 if cmf else 0)
             return
+        if fr.op_code == int(OpCode.GetMissionInfo):
+            info = parse_mission_info(fr.payload)
+            self._mission_info = info      # 업로드 확인(_upload_mission)이 기다린다
+            if info is None:
+                self._log("    └ [미션] 회신 형식이 아닙니다", "err")
+            elif not info.get("valid"):
+                self._log(f"    └ [미션] 상태={MISSION_STATE.get(info['state'], info['state'])} "
+                          f"— 적재된 미션 없음", "err")
+            else:
+                self._log(f"    └ [미션] 상태={MISSION_STATE.get(info['state'], info['state'])} "
+                          f"'{info['name']}' type={info['type']} "
+                          f"{info['body_len']}B({info['body_len'] // 8}키프레임) "
+                          f"crc=0x{info['body_crc']:08X} unit_sig=0x{info['unit_sig']:08X}", "scn")
+            return
         if fr.op_code == int(OpCode.GetEdgeCentralConfig) and len(fr.payload) >= 3 + MAX_NODES:
             ecf, unit_n, term = fr.payload[0], fr.payload[1], fr.payload[2]
             rows = []
@@ -1058,6 +1193,7 @@ class RCubeApp:
             self.scn_members = 0
             self.cube_ids = []
             self.cube_cmf = {}
+            self.cube_route = {}
             self._set_cube_boxes([])
             self._paint_buttons()
 
@@ -1330,6 +1466,40 @@ class RCubeApp:
         self.fixed_var.set(False)
         self._paint_mode_hint()
 
+    # ---- 미션코드 (기획서 7.3-2 · 8장) ----
+    def on_pick_mission(self) -> None:
+        """사용자에게 미션코드를 받는다. 파이썬 소스(.py)면 저장 시 컴파일해 올린다."""
+        path = filedialog.askopenfilename(
+            title="미션코드 선택 — 파이썬 소스(.py) 또는 컴파일된 미션(.rcm)",
+            initialdir=str(MISSION_DIR if MISSION_DIR.is_dir() else Path.cwd()),
+            filetypes=[("미션 소스/코드", "*.py *.rcm"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        self.mission_path = Path(path)
+        self.mission_var.set(f"미션코드: {self.mission_path.name}")
+        self._log(f"[미션] 선택: {self.mission_path}")
+
+    def _compile_mission(self, ids: list, choices: dict):
+        """선택한 미션을 '지금 저장할 구성'으로 컴파일한다. 실패하면 None.
+
+        노드 목록과 유닛 서명(unit_sig)을 이 저장의 멤버 맵에서 뽑는 것이 핵심이다 —
+        다른 구성에 올라간 미션은 큐브가 실행을 거부한다(확장 규격 §2.5.1 안전핀).
+        """
+        if self.mission_path is None:
+            return None
+        try:
+            sig = mission_unit_sig(len(ids), build_member_map(choices))
+            m = compile_file(self.mission_path, nodes=list(ids), cmf=dict(choices),
+                             unit_sig=sig)
+        except Exception as e:
+            self._log(f"[미션] 컴파일 실패: {e}", "err")
+            messagebox.showerror("미션 컴파일 실패", str(e))
+            return None
+        self._log(f"[미션] {m.summary()}", "scn")
+        for line in m.timeline:
+            self._log(line)
+        return m
+
     def on_save_netconf(self) -> None:
         """큐브별 통신방식(BLE/CAN)을 저장시키고 전체 재부팅(기획서 7.2). 다음 부팅부터 적용."""
         if self.active is None or not self.scn_done:
@@ -1352,37 +1522,66 @@ class RCubeApp:
         desc = ", ".join(f"{cid}:{'CAN' if choices[cid] else 'BLE'}" for cid in ids)
         edge = bool(self.edge_var.get())
 
+        # 7.3-2: "체크하면 PC가 사용자에게 미션코드를 요청한다." 아직 안 골랐으면 지금 묻고,
+        # 그래도 없으면 미션 없이 갈 것인지 확인한다(연결만 하고 아무 동작도 하지 않는 유닛).
+        mission = None
+        if edge:
+            if self.mission_path is None:
+                self.on_pick_mission()
+            if self.mission_path is None:
+                if not messagebox.askyesno(
+                        "미션코드 없음",
+                        "미션코드 없이 독립로봇유닛으로 전환할까요?\n\n"
+                        "미션이 없으면 모든 큐브가 연결돼도 유닛은 아무 동작도 하지 않습니다."):
+                    return
+            else:
+                mission = self._compile_mission(ids, choices)
+                if mission is None:
+                    return   # 컴파일 실패 — 전환 자체를 진행하지 않는다
+
         if edge and not messagebox.askyesno(
                 "독립로봇유닛 전환",
                 f"노드01을 edge central(리드 큐브)로 만들고 멤버 맵을 저장합니다.\n\n"
-                f"구성: [{desc}] · 종단노드 {term}\n\n"
+                f"구성: [{desc}] · 종단노드 {term}\n"
+                f"미션코드: {mission.summary() if mission else '없음'}\n\n"
                 "저장 후 모든 큐브가 꺼집니다. 배선을 독립유닛 형태로 정리한 뒤\n"
                 "(PC-리드 큐브 CAN 케이블 제거, 큐브끼리 노드ID 오름차순 연결)\n"
-                "버튼으로 다시 켜면 리드 큐브가 스스로 멤버를 연결합니다.\n\n"
+                "버튼으로 다시 켜면 리드 큐브가 스스로 멤버를 연결하고,\n"
+                "모두 연결되면 이 미션이 자동으로 실행됩니다(7.4-6).\n\n"
                 "진행할까요?"):
             return
 
-        # ★저장 명령은 "지금의" 통신방식으로 나가야 한다. 바뀐 방식은 재부팅 후에나
-        #   유효하므로, 현재 큐브별 CMF(cube_cmf)와 지금 PC에 직접 붙어 있는 큐브를
-        #   캡처해 전송 경로를 정한다. 매핑 파일 갱신은 전송이 끝난 뒤에 한다
-        #   (실패했는데 앱만 새 구성을 기억하면 다음 고정형 연결이 어긋난다).
-        cur_cmf = dict(self.cube_cmf)
+        # ★저장 명령은 "지금 실제로 붙어 있는 경로"로 나가야 한다. 새 통신방식은 재부팅
+        #   후에나 유효하고, 저장된 CMF도 지금 경로와 다를 수 있다 — 설정모드
+        #   (RCUBECONFIG)에서는 CMF=CAN 큐브도 BLE로 붙는다. 저장 CMF로 경로를 고르면
+        #   그 상황에서 "CAN 버스가 없다"며 아무것도 못 보내고 멈춘다(2026-08-04 실사례).
+        #   매핑 파일 갱신은 전송이 끝난 뒤에 한다(실패했는데 앱만 새 구성을 기억하면
+        #   다음 고정형 연결이 어긋난다).
+        routes = {cid: self._route_of(cid) for cid in ids}
         direct_ble = self._direct_ble_cube()
-        need_ble = any(cur_cmf.get(cid, 0) == 0 for cid in ids)
-        need_can = any(cur_cmf.get(cid, 0) == 1 for cid in ids)
+        need_ble = any(r == "ble" for r in routes.values())
+        need_can = any(r == "can" for r in routes.values())
+        rdesc = ", ".join(f"{cid}:{routes[cid].upper()}" for cid in ids)
         if need_ble and not self.ble.is_connected:
-            self._log("[네트워크] BLE 큐브가 있는데 BLE 연결이 없습니다.", "err")
+            msg = (f"BLE로 붙어 있는 큐브가 있는데 BLE 연결이 없습니다.\n현재 경로: [{rdesc}]")
+            self._log(f"[네트워크] {msg}", "err")
+            messagebox.showwarning("저장할 수 없습니다", msg)
             return
         if need_can and not self.can.is_connected:
-            self._log("[네트워크] CAN 큐브가 있는데 CAN 버스가 열려 있지 않습니다.", "err")
+            msg = (f"CAN으로 붙어 있는 큐브가 있는데 CAN 버스가 열려 있지 않습니다.\n"
+                   f"현재 경로: [{rdesc}]\n\nCAN 프레임에서 '열기'를 누른 뒤 다시 저장하세요.")
+            self._log(f"[네트워크] {msg}", "err")
+            messagebox.showwarning("저장할 수 없습니다", msg)
             return
+        self._log(f"[네트워크] 전송 경로 [{rdesc}] (저장된 CMF가 아니라 지금 붙어 있는 경로)")
 
         if edge:
             self._log(f"[독립] 저장 [{desc}] 종단노드={term} → 노드01에 ECF=1·멤버맵 저장 후 "
                       f"전체 전원끄기(7.3)", "scn")
         else:
             self._log(f"[네트워크] 저장 [{desc}] 종단노드={term} → 각 큐브 저장 후 전체 재부팅(연결 끊김)", "scn")
-        self._run(self._save_netconf_coro(ids, choices, term, edge, cur_cmf, direct_ble))
+        self._run(self._save_netconf_coro(ids, choices, term, edge, routes, direct_ble,
+                                          mission))
 
     def _save_netmap(self, n: int, choices: dict, term: int) -> None:
         try:
@@ -1417,7 +1616,7 @@ class RCubeApp:
             except Exception:
                 pass
             self.ui_q.put(("log", f"[고정형/CAN] 노드 0x{nid:02X} 연결(순서 {index + 1})"))
-            self.ui_q.put(("cube_connected", nid))
+            self.ui_q.put(("cube_connected", (nid, "can")))
 
         def work():
             # 버스가 닫혀 있으면 알아서 연다 — CAN 분기는 어댑터 없이는 시작조차 못 하므로
@@ -1454,18 +1653,19 @@ class RCubeApp:
         threading.Thread(target=work, daemon=True).start()
 
     async def _save_netconf_coro(self, ids: list, choices: dict, term: int, edge: bool,
-                                 cur_cmf: dict, direct_ble: int) -> None:
+                                 routes: dict, direct_ble: int, mission=None) -> None:
         n = len(ids)
 
         async def send_to(cid: int, build):
-            """★지금(변경 전) 통신방식으로 그 큐브에 보낸다.
+            """★지금 실제로 붙어 있는 경로로 그 큐브에 보낸다(routes).
 
-            새 방식은 재부팅 후에나 유효하므로 저장 명령 자체는 기존 경로로 가야 한다.
-            혼합 구성(예: 1·3=CAN, 2=BLE)에서 전부 BLE로 보내면 CAN 큐브는 못 받는다.
+            새 통신방식은 재부팅 후에나 유효하므로 저장 명령 자체는 기존 경로로 가야 한다.
+            그 "기존 경로"는 저장된 CMF가 아니라 **연결 때 기록한 실제 경로**다 —
+            설정모드에서는 CMF=CAN 큐브도 BLE로 붙어 있다.
             CAN에서는 0xFE가 "마스터에게"라 큐브가 받지 않으므로 항상 실제 노드ID로 지목하고,
             BLE에서는 PC에 직접 붙은 큐브만 0xFE로 보낸다(나머지는 허브가 중계).
             """
-            if cur_cmf.get(cid, 0) == 1:
+            if routes.get(cid) == "can":
                 self.can.send(build(cid))
             else:
                 await self.ble.send(build(ADDR_HUB if cid == direct_ble else cid))
@@ -1505,9 +1705,17 @@ class RCubeApp:
             self.ui_q.put(("scn_reset", "전체 재부팅 — 연결 해제"))
             return
 
-        # 7.3-3: 리드 큐브(노드01)에 ECF=1 + 전체 큐브 수 + 멤버 맵 + 종단노드ID를 저장.
-        # (미션코드 업로드 F0~F2는 8장 확정 후 이 앞 단계에 들어간다.)
+        # 7.3-2: 리드 큐브(노드01)에 미션코드를 업로드한다. ECF 저장(7.3-3)보다 먼저 하는
+        # 이유는 기획서 순서(요청 → 업로드 → 저장) 그대로이기도 하고, 업로드가 실패하면
+        # 독립 전환을 멈출 수 있어야 하기 때문이다.
         lead = ids[0]
+        if mission is not None:
+            if not await self._upload_mission(lead, mission, send_to):
+                self.ui_q.put(("log", "[미션] 업로드 실패 — 독립 전환을 중단합니다. "
+                                      "큐브 로그(F0/F1/F2 CmdAck)를 확인하세요."))
+                return
+
+        # 7.3-3: 리드 큐브(노드01)에 ECF=1 + 전체 큐브 수 + 멤버 맵 + 종단노드ID를 저장.
         member_map = build_member_map(choices)
         await send_to(lead, lambda t: build_set_edge_central(1, n, term, member_map, target_id=t))
         await asyncio.sleep(0.3)
@@ -1519,6 +1727,66 @@ class RCubeApp:
         self.ui_q.put(("log", "[독립] 전원끄기 전송 — 배선 정리 후 리드 큐브부터 켜세요. "
                               "리드 큐브가 스스로 멤버를 연결합니다(7.4)."))
         self.ui_q.put(("scn_reset", "전체 전원끄기 — 연결 해제"))
+
+    # 한 번에 보낼 본문 조각 크기. CAN 멀티프레임(최대 446B)과 BLE MTU 양쪽에 안전하고,
+    # 8바이트 레코드 경계에 딱 맞는 값으로 잡는다(레코드가 조각을 걸치지 않아 디버깅이 쉽다).
+    MISSION_CHUNK = 64
+
+    async def _upload_mission(self, lead: int, mission, send_to) -> bool:
+        """리드 큐브에 미션 본문을 올린다(F0 → F1×n → F2 → F3 확인). 성공하면 True.
+
+        조각마다 CmdAck을 기다리지는 않고 간격을 두고 밀어 넣되(큐브가 F0에서 플래시
+        슬롯을 소거하므로 첫 대기만 넉넉히 준다), **F3 회신으로 실제로 적재됐는지 확인**
+        한다. 길이·CRC가 우리가 보낸 것과 같아야 통과다 — 조각 하나가 유실되면 큐브가
+        업로드를 중단하므로, 확인 없이 넘어가면 미션 없는 유닛이 조용히 완성된다.
+        """
+        import zlib
+
+        body = mission.body
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        self.ui_q.put(("log", f"[미션] 노드{lead}에 업로드: {mission.name} "
+                              f"{len(body)}B / {mission.record_count}키프레임 "
+                              f"crc=0x{crc:08X} unit_sig=0x{mission.unit_sig:08X}"))
+        self._mission_info = None
+        try:
+            # 업로드 전에 센서 주기전송을 끈다. 켜져 있으면 큐브들이 링크를 계속 채워
+            # 조각 전송이 밀리고, 로그도 파묻혀 실패 원인을 볼 수 없다.
+            await send_to(lead, lambda t: build_set_sensor_stream(False,
+                                                                 target_id=ADDR_BROADCAST))
+            await asyncio.sleep(0.3)
+            await send_to(lead, lambda t: build_mission_upload_begin(
+                len(body), crc, mission.unit_sig, target_id=t))
+            await asyncio.sleep(0.6)   # 슬롯 소거 시간
+
+            seq = 0
+            for off in range(0, len(body), self.MISSION_CHUNK):
+                chunk = body[off:off + self.MISSION_CHUNK]
+                await send_to(lead, lambda t, s=seq, c=chunk:
+                              build_mission_upload_chunk(s, c, target_id=t))
+                seq += 1
+                await asyncio.sleep(0.15)
+
+            await send_to(lead, lambda t: build_mission_upload_commit(target_id=t))
+            await asyncio.sleep(0.5)
+            await send_to(lead, lambda t: build_get_mission_info(target_id=t))
+        except Exception as e:
+            self.ui_q.put(("log", f"[미션] 전송 오류: {e!r}"))
+            return False
+
+        for _ in range(20):            # F3 회신 최대 2초 대기
+            if self._mission_info is not None:
+                break
+            await asyncio.sleep(0.1)
+        info = self._mission_info
+        if info is None:
+            self.ui_q.put(("log", "[미션] F3 회신이 없습니다 — 리드 큐브와의 경로를 확인하세요."))
+            return False
+        if not info.get("valid") or info["body_len"] != len(body) or info["body_crc"] != crc:
+            self.ui_q.put(("log", f"[미션] 적재 확인 실패 — 큐브가 보고한 내용이 "
+                                  f"보낸 것과 다릅니다({info})"))
+            return False
+        self.ui_q.put(("log", f"[미션] 업로드 완료({seq}조각) — 리드 큐브에 '{info['name']}' 적재됨"))
+        return True
 
     def _debug_frame(self):
         """디버그 입력(Target/OpCode/payload)에서 표준 프레임을 만든다. 실패 시 None."""

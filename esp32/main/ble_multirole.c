@@ -5,6 +5,7 @@
 #include "rcube_config.h"
 #include "rcube_status.h"
 #include "rcube_sensor.h"
+#include "rcube_mission.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -29,8 +30,9 @@ static const char *TAG = "multi";
  * — 서브 허브는 PC 연결(peripheral) 1개를 추가로 쓰므로 8이 필요하다. */
 #define MAX_MEMBERS (RCUBE_MAX_NODES - 1)
 
-/* 멤버로 중계할 프레임 임시 버퍼(LED 등 소형 명령). */
-#define FWD_BUF_MAX 96
+/* 멤버로 중계할 프레임 임시 버퍼. 미션 업로드 조각(F1)이 멤버로 갈 수도 있으므로
+ * 페리페럴 수신 버퍼와 같은 상한을 쓴다 — 여기가 좁으면 중계만 조용히 실패한다. */
+#define FWD_BUF_MAX RCUBE_BLE_MAX_FRAME
 
 typedef enum {
     SLOT_FREE = 0,
@@ -351,10 +353,10 @@ static void member_ready(member_t *m)
              * 센서 전송 시작 명령을 보낸다. BLE 분기는 여기서, CAN 분기는
              * can_transport가 자기 완료 시점에 따로 지시한다. */
             rcube_cmd_sensor_stream_all(true, RCUBE_SENSOR_PERIOD_DEFAULT_MS);
-            /* 기획서 7.4-6: 이어서 저장된 미션코드 실행으로 넘어간다.
-             * 미션코드(F0~F4)는 8장 설계 확정 후 별도 구현. */
-            ESP_LOGI(TAG, "edge central: BLE 멤버 전원 연결 완료 "
-                          "(미션코드 실행은 8장에서 연결 예정)");
+            /* 기획서 7.4-6: BLE 분기 완료를 미션 레이어에 알린다. CAN 분기까지 다
+             * 모이면(또는 BLE 전용 유닛이면 곧바로) 저장된 미션이 스스로 실행된다. */
+            ESP_LOGI(TAG, "edge central: BLE 멤버 전원 연결 완료");
+            rcube_mission_branch_ready(RCUBE_MEMBER_BLE);
         }
     } else {
         rcube_buzzer_play(RCUBE_MELODY_LINK);

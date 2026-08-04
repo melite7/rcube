@@ -42,6 +42,9 @@ typedef enum {
     /* 그룹번호 알림. 음이 런타임(그룹번호)에 따라 정해지므로 고정 테이블이 없고,
      * rcube_melody_group_notes()로 그때그때 만든다. rcube_melody()는 NULL을 준다. */
     RCUBE_MELODY_GROUP,
+    /* 단일 톤(주파수+길이). 미션코드의 TONE 키프레임과 0xE6 명령이 쓴다.
+     * 역시 런타임 값이라 고정 테이블이 없다 — rcube_buzzer_play_tone()으로 요청한다. */
+    RCUBE_MELODY_TONE,
     RCUBE_MELODY_COUNT
 } rcube_melody_id_t;
 

@@ -23,6 +23,12 @@
 extern const ble_uuid128_t rcube_svc_uuid;
 extern const ble_uuid128_t rcube_chr_uuid;
 
+/* BLE로 주고받는 표준 프레임의 최대 길이. GATT write 수신 버퍼와 멤버 중계 버퍼가
+ * 이 값을 쓴다 — 둘 중 하나라도 작으면 그보다 큰 프레임이 통째로 거부된다.
+ * 가장 큰 프레임은 미션 업로드 조각(F1: 헤더4 + seq2 + 본문)이다. 협상 MTU(256)
+ * 안쪽이라 한 번의 write로 들어온다. */
+#define RCUBE_BLE_MAX_FRAME 256u
+
 /* NimBLE 스택 초기화(광고 시작 안 함). app_main에서 1회 호출. */
 void ble_rcube_init(void);
 

@@ -4,6 +4,7 @@
 #include "rcube_status.h"
 #include "rcube_buzzer.h"
 #include "rcube_sensor.h"
+#include "rcube_mission.h"
 
 #include <string.h>
 #include <inttypes.h>
@@ -36,10 +37,10 @@ static uint8_t s_node_id;
 static uint8_t s_term_id;
 static bool s_running;
 static int64_t s_last_master_us;   /* 상위(마스터) 프레임을 마지막으로 받은 시각 */
-static uint8_t s_master_src;       /* 나를 연결한 상위의 SrcId (PC=0xFE, edge central=노드ID) */
+static uint8_t s_master_src;       /* 나를 연결한 상위의 SrcId (진단용 기록) */
 
 /* ---- edge central(ECF=1)의 CAN 멤버 대기 상태 (기획서 7.4-4) ---- */
-static bool    s_edge;                       /* CAN 멤버 대기 중 */
+static bool    s_edge;                       /* CAN 멤버 대기 중 = 이 유닛의 마스터 */
 static uint8_t s_edge_expected;              /* 기대 CAN 멤버 수 */
 static uint8_t s_edge_found;                 /* 발견된 수 */
 static bool    s_edge_seen[RCUBE_MAX_NODES]; /* 인덱스 = 노드ID-1 */
@@ -80,6 +81,9 @@ static void edge_note_member(uint8_t node_id)
         uint8_t p[3] = {1, (uint8_t)(period >> 8), (uint8_t)(period & 0xFF)};
         can_transport_send(RCUBE_PRI_CONFIG, RCUBE_OP_SetSensorStream,
                            RCUBE_ADDR_BROADCAST, p, sizeof(p));
+        /* 기획서 7.4-6: CAN 분기 완료를 미션 레이어에 알린다. BLE 분기까지 다 모이면
+         * (또는 CAN 전용 유닛이면 곧바로) 저장된 미션이 스스로 실행된다. */
+        rcube_mission_branch_ready(RCUBE_MEMBER_CAN);
     } else {
         rcube_buzzer_play(RCUBE_MELODY_LINK);
     }
@@ -173,6 +177,20 @@ static esp_err_t send_multiframe(uint8_t priority, uint8_t op_code, uint8_t dst,
     return ESP_OK;
 }
 
+/* SrcId를 지정해 단일 프레임을 보낸다. 보통은 자기 노드ID지만, edge central이
+ * "이 유닛의 마스터"로서 내는 하트비트만은 0xFE로 나간다(아래 heartbeat_task 주석). */
+static esp_err_t send_one_as(uint8_t src, uint8_t priority, uint8_t op_code,
+                             uint8_t dst, const uint8_t *data, uint16_t len)
+{
+    twai_message_t msg = {0};
+    msg.identifier = RCUBE_CAN_ID(priority, op_code, 0 /*multi*/, 0 /*flag*/, src, dst);
+    msg.extd = 1;
+    msg.data_length_code = (uint8_t)len;
+    if (data && len) memcpy(msg.data, data, len);
+
+    return twai_transmit(&msg, pdMS_TO_TICKS(10));
+}
+
 esp_err_t can_transport_send(uint8_t priority, uint8_t op_code,
                              uint8_t dst, const uint8_t *data, uint16_t len)
 {
@@ -181,14 +199,7 @@ esp_err_t can_transport_send(uint8_t priority, uint8_t op_code,
     if (len > 8) {
         return send_multiframe(priority, op_code, dst, data, len);
     }
-
-    twai_message_t msg = {0};
-    msg.identifier = RCUBE_CAN_ID(priority, op_code, 0 /*multi*/, 0 /*flag*/, s_node_id, dst);
-    msg.extd = 1;
-    msg.data_length_code = (uint8_t)len;
-    if (data && len) memcpy(msg.data, data, len);
-
-    return twai_transmit(&msg, pdMS_TO_TICKS(10));
+    return send_one_as(s_node_id, priority, op_code, dst, data, len);
 }
 
 /* rcube_cmd 응답 콜백: 표준프레임을 CAN으로 회신(dst=마스터 0xFE).
@@ -341,15 +352,16 @@ static void rx_task(void *arg)
         uint8_t dst = RCUBE_CAN_DST(id);
         uint8_t src = RCUBE_CAN_SRC(id);
 
-        /* 상위(PC USB-CAN 또는 edge central) 생존 갱신 — 마스터가 보낸 것이거나
-         * 내 노드ID로 개별 지정된 것. 마스터의 주기 하트비트도 여기 포함된다.
-         * 이 시각이 끊기면 heartbeat_task의 감시가 미연결로 되돌린다. */
-        /* 상위는 둘 중 하나다: PC(USB-CAN, Src=0xFE) 또는 edge central(Src=자기 노드ID).
-         * 후자는 0xFE를 쓰지 않으므로, 한 번 연결된 뒤에는 "나를 연결한 그 Src"의
-         * 프레임을 생존 신호로 본다 — edge central의 주기 하트비트가 그 역할을 한다
-         * (이게 없으면 독립유닛 멤버가 4초마다 끊긴 것으로 오판한다). */
-        bool from_upper = (src == RCUBE_CAN_SRC_MASTER || dst == s_node_id ||
-                           (s_master_src != 0 && src == s_master_src));
+        /* 상위(PC USB-CAN 또는 edge central) 생존 갱신 — 내 노드ID로 개별 지정된
+         * 프레임이거나, "마스터"를 자처하는 Src=0xFE 프레임(주기 하트비트 포함).
+         * 이 시각이 끊기면 heartbeat_task의 감시가 미연결로 되돌린다.
+         *
+         * ★ Src=0xFE만 마스터 신호로 본다(2026-08-04 정정). 예전에는 "나를 연결한
+         * 그 Src"의 아무 프레임이나 생존 신호로 봤는데, 그러면 edge central이
+         * 리셋된 뒤 아직 아무도 연결하지 않은 상태에서 내는 평범한 노드 하트비트까지
+         * "상위 살아 있음"으로 오인해, 멤버가 영영 연결 표시에 머문다(실사례).
+         * edge central은 마스터로 동작하는 동안에만 0xFE로 하트비트를 낸다. */
+        bool from_upper = (src == RCUBE_CAN_SRC_MASTER || dst == s_node_id);
         if (from_upper) {
             s_last_master_us = esp_timer_get_time();
         }
@@ -376,16 +388,26 @@ static void rx_task(void *arg)
             continue;
         }
 
-        /* 나(node_id) 또는 브로드캐스트(0xFF)만 처리한다.
+        /* ★0xFE(허브/마스터)는 "상위에게 올리는 회신·보고"의 주소다. 명령이 아니므로
+         * 절대 명령 디스패처에 넣지 않는다.
          *
-         * ★0xFE(허브/마스터)는 "상위에게 보내는 주소"다. CAN에서는 각 큐브의 회신이
-         * dst=0xFE로 나가므로, 이걸 자기 것으로 받으면 남의 회신을 명령으로 처리한다.
-         * 특히 D4(GetNodeConfig)는 요청과 회신의 OpCode가 같아서, 한 큐브의 회신을
-         * 나머지가 요청으로 오해해 다시 회신 → 무한 증폭이 된다(CPU 포화로 부저 음이
-         * 끊기지 않던 증상). 0xFE를 받아야 하는 것은 마스터 역할인 edge central뿐이다.
+         * 요청과 회신이 OpCode를 공유하는 계열(B0 센서, D4/D6 설정 조회, F3 미션 조회…)
+         * 때문이다. 예전에는 마스터인 edge central만 예외로 이 주소를 받아 디스패치했는데,
+         * 그러면 멤버가 올린 센서 보고(B0)를 "센서 1회 조회 요청"으로 오해해 자기 센서를
+         * 되쏜다 — 멤버 보고 1건마다 edge central이 버스에 2프레임을 더하는 에코가 된다
+         * (2026-08-04 확인). 일반 큐브에서는 같은 오해가 서로를 향해 일어나 무한 증폭까지
+         * 갔던 자리다(CPU 포화로 부저 음이 끊기지 않던 증상).
+         *
+         * 그래서 지금은 역할과 무관하게 여기서 소비하고 끝낸다. 기획서 9장의 "edge
+         * central이 멤버 센서를 취합"하는 소비자는 이 자리에 붙이면 된다.
          * (BLE는 아그리게이터가 target을 0xFE로 재기입해 중계하므로 사정이 다르다.) */
-        if (dst != s_node_id && dst != RCUBE_ADDR_BROADCAST &&
-            !(dst == RCUBE_ADDR_HUB && rcube_config_ecf() == 1)) {
+        if (dst == RCUBE_ADDR_HUB) {
+            ESP_LOGD(TAG, "상위행 회신/보고 수신: src=0x%02x op=0x%02x dlc=%u → 소비",
+                     src, op, msg.data_length_code);
+            continue;
+        }
+        /* 나(node_id) 또는 브로드캐스트(0xFF)만 처리한다. */
+        if (dst != s_node_id && dst != RCUBE_ADDR_BROADCAST) {
             continue;
         }
 
@@ -487,8 +509,19 @@ static void heartbeat_task(void *arg)
         bus_watch();      /* BUS-OFF면 복구를 걸고, 복구가 끝났으면 다시 start */
         master_watch();   /* 상위가 사라졌으면 미연결 표시로 되돌린다 */
 
-        esp_err_t err = can_transport_send(RCUBE_PRI_SAFETY_SYNC, RCUBE_OP_Heartbeat,
-                                           RCUBE_ADDR_BROADCAST, &nd, 1);
+        /* edge central(마스터로 동작 중)은 Src=0xFE로 하트비트를 낸다 — PC(USB-CAN)가
+         * 하던 그 역할이다. 멤버는 이 신호로만 "내 상위가 살아 있다"를 판정하므로,
+         * 마스터가 아닌 동안(부팅 직후·강등 후)에는 절대 나가면 안 된다. 그래야
+         * edge central이 리셋되면 멤버들이 4초 안에 대기 표시로 돌아간다. */
+        esp_err_t err;
+        if (s_edge) {
+            uint8_t m = RCUBE_CAN_SRC_MASTER;
+            err = send_one_as(RCUBE_CAN_SRC_MASTER, RCUBE_PRI_SAFETY_SYNC,
+                              RCUBE_OP_Heartbeat, RCUBE_ADDR_BROADCAST, &m, 1);
+        } else {
+            err = can_transport_send(RCUBE_PRI_SAFETY_SYNC, RCUBE_OP_Heartbeat,
+                                     RCUBE_ADDR_BROADCAST, &nd, 1);
+        }
         if (err != ESP_OK) {
             if ((fail++ % 10) == 0) {
                 ESP_LOGW(TAG, "heartbeat TX 실패(%s) — 트랜시버/버스 확인(개발보드는 정상)",

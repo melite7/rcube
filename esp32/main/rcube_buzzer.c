@@ -51,10 +51,12 @@ static const char *TAG = "buz";
 /* 음 사이 짧은 무음(반복음 분리용). */
 #define INTER_NOTE_GAP_MS   6
 
-/* 큐 항목: 대부분은 id만 쓰고, GROUP만 arg(그룹번호)를 함께 싣는다. */
+/* 큐 항목: 대부분은 id만 쓰고, GROUP은 arg(그룹번호)를, TONE은 freq/dur를 함께 싣는다. */
 typedef struct {
     rcube_melody_id_t id;
     uint8_t           arg;
+    uint16_t          freq_hz;
+    uint16_t          dur_ms;
 } buz_item_t;
 
 static QueueHandle_t s_queue;
@@ -136,6 +138,16 @@ static void buzzer_task(void *arg)
         if (xQueueReceive(s_queue, &item, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        if (item.id == RCUBE_MELODY_TONE) {
+            /* 미션 TONE 키프레임 / 0xE6 명령. 음 하나를 지정 주파수·길이로 낸다.
+             * 여기서는 음 사이 간격(INTER_NOTE_GAP_MS)을 넣지 않는다 — 언제 울릴지는
+             * 상위(미션 시퀀서)가 t_ms로 정하므로 부저가 시간을 더하면 어긋난다. */
+            ESP_LOGI(TAG, "tone %u Hz / %u ms", item.freq_hz, item.dur_ms);
+            rcube_buzzer_tone(item.freq_hz);
+            vTaskDelay(pdMS_TO_TICKS(item.dur_ms));
+            rcube_buzzer_tone(0);
+            continue;
+        }
         if (item.id == RCUBE_MELODY_GROUP) {
             /* 그룹번호 알림은 음이 런타임에 정해지므로 여기서 만든다(기획서 5장). */
             rcube_note_t notes[RCUBE_GROUP_NOTE_COUNT];
@@ -206,15 +218,20 @@ void rcube_buzzer_init(void)
              s_volume, 100.0f * (float)tone_duty() / (float)(BUZZER_DUTY_MAX + 1u));
 }
 
-static void enqueue(rcube_melody_id_t id, uint8_t arg)
+static void enqueue_full(rcube_melody_id_t id, uint8_t arg, uint16_t freq_hz, uint16_t dur_ms)
 {
     if (!s_ready || s_queue == NULL) {
         return;
     }
-    buz_item_t item = { .id = id, .arg = arg };
+    buz_item_t item = { .id = id, .arg = arg, .freq_hz = freq_hz, .dur_ms = dur_ms };
     if (xQueueSend(s_queue, &item, 0) != pdTRUE) {
         ESP_LOGW(TAG, "melody 큐 가득참 → drop (id=%d)", (int)id);
     }
+}
+
+static void enqueue(rcube_melody_id_t id, uint8_t arg)
+{
+    enqueue_full(id, arg, 0, 0);
 }
 
 void rcube_buzzer_play(rcube_melody_id_t id)
@@ -225,4 +242,12 @@ void rcube_buzzer_play(rcube_melody_id_t id)
 void rcube_buzzer_play_group(uint8_t group_id)
 {
     enqueue(RCUBE_MELODY_GROUP, group_id);
+}
+
+void rcube_buzzer_play_tone(uint16_t freq_hz, uint16_t dur_ms)
+{
+    if (dur_ms == 0) {
+        return;
+    }
+    enqueue_full(RCUBE_MELODY_TONE, 0, freq_hz, dur_ms);
 }

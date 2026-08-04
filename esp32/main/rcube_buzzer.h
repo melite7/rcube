@@ -32,6 +32,11 @@ void rcube_buzzer_play_group(uint8_t group_id);
 /* 단일 톤 즉시 출력(freq_hz=0 이면 무음). 저수준/테스트용. */
 void rcube_buzzer_tone(uint16_t freq_hz);
 
+/* 음 하나를 지정 주파수·길이로 재생 요청(큐에 넣고 즉시 반환).
+ * 미션코드의 TONE 키프레임과 0xE6 GenerateBuzzerTone이 쓴다. freq_hz=0이면 그 길이만큼
+ * 쉰다(재생 태스크가 점유된다). dur_ms=0이면 아무 것도 하지 않는다. */
+void rcube_buzzer_play_tone(uint16_t freq_hz, uint16_t dur_ms);
+
 /* 전역 음량 0~100(%). 사각파 ON 비율을 줄여 조절하므로 음정은 변하지 않는다.
  * 기본값은 rcube_buzzer.c의 BUZZER_VOLUME_DEFAULT. */
 void rcube_buzzer_set_volume(uint8_t percent);

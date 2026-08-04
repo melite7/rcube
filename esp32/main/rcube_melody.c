@@ -7,10 +7,9 @@ const uint16_t rcube_piano_scale[RCUBE_PIANO_SCALE_LEN] = {
 };
 
 /* ── START (부팅/시작음): B3, D4, B4 ──
- * xlsx '멜로디 데이터'는 0.5 / 0.5 / 1.0초(총 2초)인데, 재생 속도를 2배로 하라는
+ * 원본(G큐브)은 0.5 / 0.5 / 1.0초(총 2초)였는데, 재생 속도를 2배로 하라는
  * 요청(2026-07-30)에 따라 길이를 절반으로 줄였다(총 1초). 음과 순서는 그대로다.
- * ★ 따라서 이 항목은 xlsx와 의도적으로 다르다 — 대조 스크립트가 START를 불일치로
- *   표시하는 것이 정상이다. */
+ * xlsx '멜로디 데이터'도 2026-08-04에 이 값으로 갱신해 이제 양쪽이 일치한다. */
 static const rcube_note_t START_NOTES[] = {
     {1, 250}, {3, 250}, {8, 500},
 };
@@ -58,6 +57,7 @@ static const rcube_note_t EDGE_NOTES[] = {
 
 #define MELODY(arr, nm) { .notes = (arr), .count = (uint8_t)(sizeof(arr)/sizeof((arr)[0])), .name = (nm) }
 
+/* GROUP·TONE은 런타임 생성이라 테이블이 비어 있다(notes=NULL → rcube_melody()가 NULL). */
 static const rcube_melody_t MELODIES[RCUBE_MELODY_COUNT] = {
     [RCUBE_MELODY_START]          = MELODY(START_NOTES, "START"),
     [RCUBE_MELODY_BUTTON_PRESSED] = MELODY(BUTTON_NOTES, "BUTTON_PRESSED"),
@@ -66,7 +66,6 @@ static const rcube_melody_t MELODIES[RCUBE_MELODY_COUNT] = {
     [RCUBE_MELODY_LINK_WAIT]      = MELODY(LINK_WAIT_NOTES, "LINKWAIT"),
     [RCUBE_MELODY_EDGE]           = MELODY(EDGE_NOTES, "EDGE"),
     [RCUBE_MELODY_DISCONNECT]     = MELODY(DISCONNECT_NOTES, "DISCONNECT"),
-    /* RCUBE_MELODY_GROUP은 런타임 생성이라 테이블이 비어 있다(notes=NULL). */
 };
 
 const rcube_melody_t *rcube_melody(rcube_melody_id_t id)

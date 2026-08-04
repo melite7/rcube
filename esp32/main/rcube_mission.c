@@ -1,6 +1,8 @@
 #include "rcube_mission.h"
 #include "rcube_config.h"
 #include "rcube_params.h"
+#include "rcube_cmd.h"
+#include "rcube_buzzer.h"
 #include "motion_core.h"
 
 #include <string.h>
@@ -10,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_crc.h"
+#include "esp_timer.h"
 #include "nvs.h"
 
 #include "rcube_protocol.h"
@@ -340,7 +343,10 @@ static uint8_t validate(uint32_t *out_count)
     for (uint32_t i = 0; i < count; i++) {
         uint16_t t; uint8_t node, kind; int32_t v;
         if (!read_record(i, &t, &node, &kind, &v)) return RCUBE_RC_FLASH_FAIL;
-        if (kind != RCUBE_MISSION_KIND_ANGLE) return RCUBE_RC_BAD_PARAM;
+        if (kind != RCUBE_MISSION_KIND_ANGLE && kind != RCUBE_MISSION_KIND_TONE) {
+            ESP_LOGE(TAG, "키프레임 %lu: 미지원 kind=%u", (unsigned long)i, kind);
+            return RCUBE_RC_BAD_PARAM;
+        }
         if (node < 1 || node > RCUBE_MAX_NODES) return RCUBE_RC_NODE_NOT_FOUND;
         /* 멤버 맵이 있으면 등장 노드가 실제 유닛에 있는지 본다(단일 큐브면 생략). */
         if (rcube_config_unit_count() > 0 &&
@@ -348,6 +354,14 @@ static uint8_t validate(uint32_t *out_count)
             ESP_LOGE(TAG, "키프레임 %lu: 노드 %u가 멤버 맵에 없다",
                      (unsigned long)i, node);
             return RCUBE_RC_NODE_NOT_FOUND;
+        }
+        if (kind == RCUBE_MISSION_KIND_TONE) {
+            /* 길이 0은 "언제 끝나는지 없는 음"이라 시퀀서가 진행할 수 없다. */
+            if (RCUBE_MISSION_TONE_DUR(v) == 0) {
+                ESP_LOGE(TAG, "키프레임 %lu: TONE 길이가 0", (unsigned long)i);
+                return RCUBE_RC_BAD_PARAM;
+            }
+            continue;   /* 톤은 각도 리밋 검사 대상이 아니다 */
         }
         /* ★ 3단 안전 1단: 자기 축 목표가 소프트리밋 안인지 실행 전에 전수 검사한다.
          * 중간에 멈추는 것보다 한 축도 움직이지 않고 거부하는 편이 안전하다. */
@@ -361,8 +375,39 @@ static uint8_t validate(uint32_t *out_count)
     return RCUBE_RC_OK;
 }
 
-/* 시퀀서 — 자기 노드 키프레임을 motion_core 큐에 넣는다.
- * 다른 노드 분배는 edge central 레이어의 몫이라 여기서는 로그만 남긴다(TODO 8장 후반). */
+/* 미션 시작(T0) 기준 t_ms가 될 때까지 기다린다. 중지 요청이 오면 즉시 나온다.
+ * 남은 시간이 길 때는 10ms씩, 가까워지면 1틱씩 자며 접근한다 — 톤의 시작 시각이
+ * 큐브 간에 어긋나면 "동시에"가 깨지므로 마지막 구간은 촘촘히 본다. */
+static void wait_until(int64_t t0_us, uint16_t t_ms)
+{
+    int64_t deadline = t0_us + (int64_t)t_ms * 1000;
+    while (!s_stop_req) {
+        int64_t remain = deadline - esp_timer_get_time();
+        if (remain <= 0) {
+            return;
+        }
+        vTaskDelay(remain > 20000 ? pdMS_TO_TICKS(10) : 1);
+    }
+}
+
+/* TONE 키프레임 1개를 멤버에게 보낸다(0xE6). 통신방식은 rcube_cmd가 멤버 맵으로 고른다. */
+static void dispatch_tone(uint8_t node, uint16_t freq, uint16_t dur)
+{
+    uint8_t p[4] = {
+        (uint8_t)(freq >> 8), (uint8_t)(freq & 0xFF),
+        (uint8_t)(dur >> 8),  (uint8_t)(dur & 0xFF),
+    };
+    if (rcube_cmd_send_to_node(node, RCUBE_OP_GenerateBuzzerTone, p, sizeof(p)) != 0) {
+        ESP_LOGW(TAG, "노드 %u에 톤 전달 실패(경로 없음) — %u Hz / %u ms", node, freq, dur);
+    }
+}
+
+/* 시퀀서 — "무엇을, 언제"를 풀어 자기 축과 멤버에게 분배한다(기획서 8장 중앙 제어).
+ *   ANGLE : 자기 노드분만 motion_core 큐에 적재하고 마지막에 한 번에 출발시킨다.
+ *           (멤버 축 분배는 다축 동기 규격(§3.4)을 얹을 때 이어 붙인다.)
+ *   TONE  : t_ms가 될 때까지 기다렸다가, 같은 시각의 레코드를 한 묶음으로 낸다.
+ *           원격 멤버를 먼저 보내고 자기 것을 마지막에 울린다 — 전송 지연만큼
+ *           멤버가 늦으므로, 자기가 먼저 울리면 그만큼 어긋난다. */
 static void play_task(void *arg)
 {
     uint32_t count = (uint32_t)(uintptr_t)arg;
@@ -373,7 +418,10 @@ static void play_task(void *arg)
              (unsigned long)count, me, repeat ? "예" : "아니오");
     do {
         uint16_t seq = 0;
-        for (uint32_t i = 0; i < count && !s_stop_req; i++) {
+        bool pushed_angle = false;
+        int64_t t0 = esp_timer_get_time();
+        uint32_t i = 0;
+        while (i < count && !s_stop_req) {
             while (s_paused && !s_stop_req) {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
@@ -382,24 +430,56 @@ static void play_task(void *arg)
                 ESP_LOGE(TAG, "키프레임 %lu 읽기 실패 → 중단", (unsigned long)i);
                 break;
             }
-            if (node != me) {
-                /* TODO(8장 후반): edge central이 멤버 통신방식에 맞춰 분배한다. */
+
+            if (kind == RCUBE_MISSION_KIND_ANGLE) {
+                i++;
+                if (node != me) {
+                    continue;
+                }
+                motion_waypoint_t wp = {
+                    .t_offset_us = (uint32_t)t_ms * 1000u,
+                    .position = v,
+                    .velocity = 0,
+                    .flags = 0,
+                    .seq = seq,
+                };
+                if (!motion_core_push(&wp, true /* Buffered */)) {
+                    ESP_LOGW(TAG, "모션 큐 가득참 — 잠시 대기");
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    i--;   /* 같은 레코드 재시도(seq는 성공했을 때만 올린다) */
+                } else {
+                    seq++;
+                    pushed_angle = true;
+                }
                 continue;
             }
-            motion_waypoint_t wp = {
-                .t_offset_us = (uint32_t)t_ms * 1000u,
-                .position = v,
-                .velocity = 0,
-                .flags = 0,
-                .seq = seq++,
-            };
-            if (!motion_core_push(&wp, true /* Buffered */)) {
-                ESP_LOGW(TAG, "모션 큐 가득참 — 잠시 대기");
-                vTaskDelay(pdMS_TO_TICKS(50));
-                i--;   /* 같은 레코드 재시도 */
+
+            /* TONE — 같은 t_ms의 연속 레코드를 한 묶음으로 처리한다. */
+            wait_until(t0, t_ms);
+            uint16_t group_t = t_ms;
+            uint16_t self_freq = 0, self_dur = 0;
+            while (i < count && !s_stop_req) {
+                if (!read_record(i, &t_ms, &node, &kind, &v)) {
+                    break;
+                }
+                if (t_ms != group_t || kind != RCUBE_MISSION_KIND_TONE) {
+                    break;
+                }
+                uint16_t freq = RCUBE_MISSION_TONE_FREQ(v);
+                uint16_t dur  = RCUBE_MISSION_TONE_DUR(v);
+                if (node == me) {
+                    self_freq = freq;
+                    self_dur = dur;
+                } else {
+                    dispatch_tone(node, freq, dur);
+                }
+                i++;
+            }
+            if (self_dur > 0 && !s_stop_req) {
+                rcube_buzzer_play_tone(self_freq, self_dur);
             }
         }
-        if (!s_stop_req) {
+        if (pushed_angle && !s_stop_req) {
             motion_core_execute(MOTION_EXEC_RUN, 0);   /* 적재분 즉시 출발 */
         }
         /* 반복이면 한 사이클이 끝날 시간을 두고 다시 채운다. */
@@ -451,5 +531,44 @@ uint8_t rcube_mission_control(uint8_t action)
         return RCUBE_RC_OK;
     default:
         return RCUBE_RC_BAD_PARAM;
+    }
+}
+
+/* ---- 연결 완료 → 자동 실행 (기획서 7.4-6) ---------------------------- */
+
+/* 분기별 완료 표시. 인덱스 = CMF(0=BLE, 1=CAN). */
+static bool s_branch_done[2];
+static bool s_autostarted;
+
+void rcube_mission_branch_ready(uint8_t cmf)
+{
+    if (cmf > RCUBE_MEMBER_CAN) {
+        return;
+    }
+    s_branch_done[cmf] = true;
+
+    if (rcube_config_ecf() != 1 || s_autostarted || s_running) {
+        return;
+    }
+    /* 맵이 요구하는 분기가 다 모여야 "필요한 모든 큐브가 연결"이다. 혼합 구성에서
+     * 한쪽 분기만 보고 출발하면 아직 붙지 않은 큐브가 미션에서 빠진다. */
+    if (rcube_config_has_member(RCUBE_MEMBER_BLE) && !s_branch_done[RCUBE_MEMBER_BLE]) {
+        return;
+    }
+    if (rcube_config_has_member(RCUBE_MEMBER_CAN) && !s_branch_done[RCUBE_MEMBER_CAN]) {
+        return;
+    }
+    if (!s_loaded) {
+        ESP_LOGW(TAG, "유닛 연결 완료 — 그러나 적재된 미션이 없다(7.3-2에서 업로드 필요)");
+        return;
+    }
+
+    s_autostarted = true;
+    uint8_t rc = rcube_mission_control(RCUBE_MISSION_RUN);
+    if (rc == RCUBE_RC_OK) {
+        ESP_LOGI(TAG, "유닛 연결 완료 → 저장된 미션 자동 실행(7.4-6)");
+    } else {
+        ESP_LOGE(TAG, "유닛 연결 완료 — 미션 자동 실행 거부됨(rc=0x%02x). "
+                      "unit_sig/노드ID/리밋 검증 실패 여부를 로그에서 확인하라.", rc);
     }
 }
