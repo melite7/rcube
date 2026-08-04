@@ -28,8 +28,9 @@ static const char *TAG = "can";
 
 #define HEARTBEAT_MS 1000
 
-/* 상위가 이만큼 조용했다가 다시 말을 걸면 "새 연결"로 보고 연결음을 울린다. */
-#define MASTER_QUIET_US (3 * 1000 * 1000)
+/* 상위가 이만큼 조용하면 연결이 끊긴 것으로 보고 미연결 표시로 되돌린다.
+ * 상위(PC/edge central)는 연결 유지 동안 1초 주기 하트비트를 보내므로 그 4배로 잡는다. */
+#define MASTER_TIMEOUT_US (4 * 1000 * 1000)
 
 static uint8_t s_node_id;
 static uint8_t s_term_id;
@@ -339,28 +340,25 @@ static void rx_task(void *arg)
         uint8_t dst = RCUBE_CAN_DST(id);
         uint8_t src = RCUBE_CAN_SRC(id);
 
-        /* 상위(PC USB-CAN 또는 edge central)가 나에게 말을 걸었다 = 연결됐다.
-         * CAN에는 BLE의 GAP CONNECT 같은 이벤트가 없으므로, "마스터가 보낸 프레임"
-         * 또는 "내 노드ID로 개별 지정된 프레임"의 수신을 연결 성립으로 본다.
-         * 고정형 큐브는 자기 노드ID를 이미 알고 있으므로 그 색으로 상시 점등한다
-         * (기획서 5장 [LED] · 7.2-7 [CAN 분기] — 상위는 확인만 한다).
-         * 하트비트/부팅알림은 다른 멤버가 브로드캐스트한 것이라 제외한다.
-         *
-         * 연결음은 "조용하다가 다시 말을 걸어온" 순간마다 울린다. CAN에는 끊김
-         * 이벤트가 없어 한 번 LINKED가 되면 영영 유지되므로, 그것만 기준으로 삼으면
-         * 두 번째 연결부터는 소리가 나지 않는다(PC에서 R3를 다시 눌러도 무음).
-         * 상위는 연결 시 프레임을 몰아서 보내므로, 한 번의 연결 절차에 한 번만 울린다. */
-        if (op != RCUBE_OP_Heartbeat && op != RCUBE_OP_NodeAnnounce &&
-            (src == RCUBE_CAN_SRC_MASTER || dst == s_node_id)) {
-            int64_t now = esp_timer_get_time();
-            bool reconnected = (now - s_last_master_us) > MASTER_QUIET_US;
-            s_last_master_us = now;
-            if (reconnected || rcube_status_mode() != RCUBE_LED_LINKED) {
-                rcube_status_set_mode(RCUBE_LED_LINKED);
-                rcube_buzzer_play(RCUBE_MELODY_LINK);
-                ESP_LOGI(TAG, "상위 연결(src=0x%02x dst=0x%02x op=0x%02x) → 연결음 + 노드ID 색 점등",
-                         src, dst, op);
-            }
+        /* 상위(PC USB-CAN 또는 edge central) 생존 갱신 — 마스터가 보낸 것이거나
+         * 내 노드ID로 개별 지정된 것. 마스터의 주기 하트비트도 여기 포함된다.
+         * 이 시각이 끊기면 heartbeat_task의 감시가 미연결로 되돌린다. */
+        bool from_upper = (src == RCUBE_CAN_SRC_MASTER || dst == s_node_id);
+        if (from_upper) {
+            s_last_master_us = esp_timer_get_time();
+        }
+
+        /* 연결 성립: CAN에는 BLE의 GAP CONNECT 같은 이벤트가 없으므로, 상위가 나를
+         * 지목해 보낸 "명령"의 수신을 연결로 본다. 고정형 큐브는 자기 노드ID를 이미
+         * 알고 있으므로 그 색으로 상시 점등한다(기획서 5장 [LED] · 7.2-7).
+         * 하트비트/부팅알림은 "살아 있다"는 신호일 뿐이라 연결 판정에서 제외한다 —
+         * 그래야 상위의 주기 하트비트만으로 연결된 것처럼 보이지 않는다. */
+        if (op != RCUBE_OP_Heartbeat && op != RCUBE_OP_NodeAnnounce && from_upper &&
+            rcube_status_mode() != RCUBE_LED_LINKED) {
+            rcube_status_set_mode(RCUBE_LED_LINKED);
+            rcube_buzzer_play(RCUBE_MELODY_LINK);
+            ESP_LOGI(TAG, "상위 연결(src=0x%02x dst=0x%02x op=0x%02x) → 연결음 + 노드ID 색 점등",
+                     src, dst, op);
         }
 
         /* edge central: 멤버의 부팅 알림/하트비트로 존재를 확인한다(7.4-4).
@@ -371,8 +369,16 @@ static void rx_task(void *arg)
             continue;
         }
 
-        /* 나(node_id)/허브(0xFE)/브로드캐스트(0xFF) 대상만 처리. */
-        if (dst != s_node_id && dst != RCUBE_ADDR_HUB && dst != RCUBE_ADDR_BROADCAST) {
+        /* 나(node_id) 또는 브로드캐스트(0xFF)만 처리한다.
+         *
+         * ★0xFE(허브/마스터)는 "상위에게 보내는 주소"다. CAN에서는 각 큐브의 회신이
+         * dst=0xFE로 나가므로, 이걸 자기 것으로 받으면 남의 회신을 명령으로 처리한다.
+         * 특히 D4(GetNodeConfig)는 요청과 회신의 OpCode가 같아서, 한 큐브의 회신을
+         * 나머지가 요청으로 오해해 다시 회신 → 무한 증폭이 된다(CPU 포화로 부저 음이
+         * 끊기지 않던 증상). 0xFE를 받아야 하는 것은 마스터 역할인 edge central뿐이다.
+         * (BLE는 아그리게이터가 target을 0xFE로 재기입해 중계하므로 사정이 다르다.) */
+        if (dst != s_node_id && dst != RCUBE_ADDR_BROADCAST &&
+            !(dst == RCUBE_ADDR_HUB && rcube_config_ecf() == 1)) {
             continue;
         }
 
@@ -440,6 +446,25 @@ static void bus_watch(void)
     }
 }
 
+/* 상위 연결 감시 — CAN에는 BLE의 DISCONNECT 이벤트가 없다. 상위(PC 앱/edge central)가
+ * 하트비트를 끊으면(앱 종료·케이블 분리) 연결이 사라진 것이므로, BLE에서 끊겼을 때와
+ * 똑같이 지정색을 버리고 미연결 점멸로 되돌리고 끊김음을 낸다(기획서 5장 [LED]·[소리]). */
+static void master_watch(void)
+{
+    if (s_last_master_us == 0 || rcube_status_mode() != RCUBE_LED_LINKED) {
+        return;
+    }
+    if ((esp_timer_get_time() - s_last_master_us) < MASTER_TIMEOUT_US) {
+        return;
+    }
+    s_last_master_us = 0;
+    rcube_status_clear_color();
+    rcube_status_exit_connect_mode();   /* 버튼으로 들어왔던 연결모드도 함께 푼다 */
+    rcube_status_set_mode(RCUBE_LED_IDLE);
+    rcube_buzzer_play(RCUBE_MELODY_DISCONNECT);
+    ESP_LOGI(TAG, "상위 하트비트 %d초 끊김 → 미연결 표시로 복귀", (int)(MASTER_TIMEOUT_US / 1000000));
+}
+
 /* ---- 하트비트/부팅 알림 --------------------------------------------- */
 static void heartbeat_task(void *arg)
 {
@@ -451,7 +476,8 @@ static void heartbeat_task(void *arg)
     uint32_t fail = 0;
     uint32_t tick = 0;
     while (1) {
-        bus_watch();   /* BUS-OFF면 복구를 걸고, 복구가 끝났으면 다시 start */
+        bus_watch();      /* BUS-OFF면 복구를 걸고, 복구가 끝났으면 다시 start */
+        master_watch();   /* 상위가 사라졌으면 미연결 표시로 되돌린다 */
 
         esp_err_t err = can_transport_send(RCUBE_PRI_SAFETY_SYNC, RCUBE_OP_Heartbeat,
                                            RCUBE_ADDR_BROADCAST, &nd, 1);
